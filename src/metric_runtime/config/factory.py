@@ -161,7 +161,12 @@ def build_runtime(
             )
 
     state_store = build_state_store(profile_cfg, connections)
-    return KPIEngine(catalog=catalog, executor=executor, state_store=state_store)
+    return KPIEngine(
+        catalog=catalog,
+        executor=executor,
+        state_store=state_store,
+        state_policy=state_policy_from_project(project),
+    )
 
 
 def state_policy_from_project(project: MetricRuntimeProjectConfig) -> StatePolicy:

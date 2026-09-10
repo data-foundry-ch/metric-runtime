@@ -53,7 +53,6 @@ def rank_explanatory_candidates(
     at: datetime | None = None,
     *,
     preferred_leaves: tuple[str, ...] = (),
-    deprioritize_sides: tuple[str, ...] = ("operations",),
 ) -> list[ExplanatoryCandidate]:
     catalog = engine.catalog_dict
     candidates: list[ExplanatoryCandidate] = []
@@ -67,8 +66,6 @@ def rank_explanatory_candidates(
                 name, at, status.value, status.baseline_mean, filters
             )
         leaf_rank = 0 if name in preferred_leaves else 1
-        if catalog[name].presentation().get("graph_side") in deprioritize_sides:
-            leaf_rank = 3
         score = float(depth) * 10.0 - leaf_rank * 100.0 + min(status.severity, 50.0)
         candidates.append(
             ExplanatoryCandidate(

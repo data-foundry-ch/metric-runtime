@@ -95,6 +95,18 @@ State determines whether the organization should care yet.
 Don't poll the whole business. Propagate change through it.
 Business semantics become software.
 
+The authoritative loop is ``KPIEngine.process`` (alias ``tick``):
+
+```python
+result = engine.process(
+    metric="profit_margin",
+    at=timestamp,
+    scope={"city": "Amsterdam"},
+)
+# result.transition == (previous_state, current_state)
+# result.new_incidents / result.notifications only on meaningful changes
+```
+
 ## Quick start
 
 ### A. Pure Python (embedding)

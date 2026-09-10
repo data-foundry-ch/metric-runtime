@@ -15,6 +15,16 @@ class Notifier(Protocol):
     def notify(self, incident: Incident) -> None: ...
 
 
+class RecordingNotifier:
+    """Collect notifications for tests."""
+
+    def __init__(self) -> None:
+        self.incidents: list[Incident] = []
+
+    def notify(self, incident: Incident) -> None:
+        self.incidents.append(incident)
+
+
 class NullNotifier:
     """No-op notifier for local runs."""
 

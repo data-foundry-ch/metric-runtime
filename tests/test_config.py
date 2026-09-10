@@ -109,6 +109,8 @@ def test_local_profile_builds_duckdb_and_memory():
     )
     assert isinstance(engine.executor, DuckDBExecutor)
     assert isinstance(engine.state_store, InMemoryStateStore)
+    assert engine.state_policy.min_impact_eur == 40.0
+    assert engine.state_policy.persistence == 2
     assert len(engine.catalog) > 5
 
 
