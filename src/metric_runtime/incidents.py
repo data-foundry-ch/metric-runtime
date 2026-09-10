@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from metric_runtime.identity import ensure_utc
 from metric_runtime.investigation import investigate_metric, preferred_explanatory_path
 from metric_runtime.models import Incident, IncidentState, InvestigationResult, QualityReport
 from metric_runtime.ownership import resolve_alert_owner
@@ -17,7 +18,7 @@ def incident_from_investigation(
     at: datetime,
     inv: InvestigationResult,
     state: IncidentState,
-    first_detected: str,
+    first_detected: datetime,
     estimated_impact: float,
     persistence_windows: int = 1,
     context: list[str] | None = None,
@@ -30,7 +31,7 @@ def incident_from_investigation(
     explanatory = primary.name if primary else center_kpi
     suppressed = [n for n in path if n != explanatory]
     roots = [c.name for c in inv.deepest_candidates]
-    opened = at.isoformat(sep=" ") if state == IncidentState.OPEN else None
+    stamp = ensure_utc(at)
     return Incident(
         primary_metric=center_kpi,
         explanatory_kpi=explanatory,
@@ -38,9 +39,9 @@ def incident_from_investigation(
         scope=scope,
         owner=owner,
         state=state,
-        opened_at=opened,
-        updated_at=at.isoformat(sep=" "),
-        first_detected=first_detected,
+        opened_at=stamp if state == IncidentState.OPEN else None,
+        updated_at=stamp,
+        first_detected=ensure_utc(first_detected),
         estimated_impact=max(estimated_impact, inv.impact_eur),
         evidence=list(path),
         related_metrics=list(suppressed),
@@ -118,7 +119,7 @@ def open_smart_incident(
         at=investigate_at,
         inv=inv,
         state=state,
-        first_detected=first_detected.isoformat(sep=" "),
+        first_detected=first_detected,
         estimated_impact=last_impact,
         persistence_windows=consecutive,
         context=context,

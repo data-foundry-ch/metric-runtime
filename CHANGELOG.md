@@ -36,3 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Split observation / metric-state / incident store protocols (composed by ``StateStore``)
 - ``KPIStateTransition`` and resolve / acknowledge / suppress semantics
 - ``StatePolicy`` wired from ``metric-runtime.yaml`` into ``build_runtime``
+- True idempotency via ``EvaluationKey`` + ``get_observation`` before warehouse evaluation
+- Notification outbox (``enqueue`` then ``deliver_notifications``)
+- ``MetricStateRecord`` with ``resolved_at`` / ``state_since``
+- Scope identity via canonical JSON + SHA-256
+- Timezone-aware datetime fields on observations / incidents
+- Impact ``quantity_delta`` + ``unit_value_metric`` (no hardcoded ``average_order_value``)

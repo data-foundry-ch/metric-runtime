@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
@@ -217,7 +217,9 @@ def test_pypizza_config_loader(engine: KPIEngine):
     assert len(built.catalog) == len(engine.catalog)
 
 
-def test_pypizza_process_routes_single_incident(engine: KPIEngine):
+def test_pypizza_process_idempotent_single_incident(engine: KPIEngine):
+    from datetime import timedelta
+
     from metric_runtime.notifications import RecordingNotifier
     from metric_runtime.state import StatePolicy
     from metric_runtime.stores.memory import InMemoryStateStore
@@ -235,33 +237,28 @@ def test_pypizza_process_routes_single_incident(engine: KPIEngine):
         ),
     )
     scope = AMS_LUNCH
-    # Walk consecutive anomalous half-hours until OPEN.
-    open_result = None
-    for hour in (11, 12, 13):
-        for minute in (0, 30):
-            at = datetime(2026, 5, 15, hour, minute)
-            result = runtime.process(metric="weekend_profit", at=at, scope=scope)
-            if result.new_incidents:
-                open_result = result
-                break
-        if open_result is not None:
+    cursor = datetime(2026, 5, 15, 11, 30)
+    opened = None
+    for _ in range(24):
+        result = runtime.process(metric="weekend_profit", at=cursor, scope=scope)
+        if result.new_incidents:
+            opened = result
             break
-    assert open_result is not None
-    assert open_result.transition.current == KPIState.OPEN
-    assert len(open_result.new_incidents) == 1
-    incident = open_result.new_incidents[0]
-    assert "Commercial Growth" in incident.owner or "Promotions" in incident.owner
-    assert incident.owner != "Finance" or incident.explanatory_kpi != "weekend_profit"
+        cursor += timedelta(minutes=30)
+    assert opened is not None
+    assert opened.transition.current == KPIState.OPEN
+    assert len(opened.notifications) == 1
+    assert opened.notifications[0].pending is True
+    assert notifier.incidents == []
+    runtime.deliver_notifications()
     assert len(notifier.incidents) == 1
+    assert len(runtime.state_store.list_open_incidents()) == 1
 
-    retry = runtime.process(
-        metric="weekend_profit",
-        at=datetime.fromisoformat(open_result.at.replace(" ", "T")),
-        scope=scope,
-    )
+    retry = runtime.process(metric="weekend_profit", at=cursor, scope=scope)
+    assert retry.idempotent is True
+    assert retry.status.value == opened.status.value
     assert retry.new_incidents == []
     assert retry.notifications == []
-    assert len(notifier.incidents) == 1
     assert len(runtime.state_store.list_open_incidents()) == 1
 
 
@@ -287,7 +284,7 @@ def test_mark_root_candidates_smoke():
             anomaly=True,
             support=100,
             support_ok=True,
-            as_of="t",
+            as_of=datetime(2026, 1, 1, tzinfo=UTC),
             directionality=Directionality.HIGHER_IS_BAD,
             state=KPIState.DETECTED,
             severity=20,

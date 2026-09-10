@@ -82,6 +82,8 @@ def evolve_state(
     - unhealthy quality → SUPPRESSED
     - enough healthy windows after OPEN/ACK → RESOLVED
     - ACKNOWLEDGED is sticky while the anomaly persists
+
+    Callers must pass only state-eligible observations in ``history``.
     """
     policy = policy or StatePolicy()
     previous = previous or KPIState.NORMAL

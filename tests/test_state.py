@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from metric_runtime.models import Directionality, KPIState, KPIStatus, QualityReport
 from metric_runtime.state import StatePolicy, evolve_state
+
+_AS_OF = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
 
 
 def _anom() -> KPIStatus:
@@ -17,7 +21,7 @@ def _anom() -> KPIStatus:
         anomaly=True,
         support=100,
         support_ok=True,
-        as_of="t",
+        as_of=_AS_OF,
         directionality=Directionality.LOWER_IS_BAD,
         state=KPIState.DETECTED,
         severity=5.0,
@@ -61,7 +65,7 @@ def _healthy() -> KPIStatus:
         anomaly=False,
         support=100,
         support_ok=True,
-        as_of="t",
+        as_of=_AS_OF,
         directionality=Directionality.LOWER_IS_BAD,
         state=KPIState.NORMAL,
         severity=0.0,

@@ -109,7 +109,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             directionality=Directionality.TWO_SIDED,
             detector=seasonal,
             support=SupportRequirement(measure=Measure.ORDERS, minimum=30),
-            impact=ImpactModel(kind="orders_delta"),
+            impact=ImpactModel(kind="quantity_delta", unit_value_metric="average_order_value"),
             unit="count",
             metadata=_presentation(2, "marketing"),
         ),

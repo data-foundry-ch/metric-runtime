@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from metric_runtime import (
     KPI,
     Formula,
@@ -17,7 +19,7 @@ from metric_runtime.models import Directionality
 
 def test_public_import_surface():
     assert KPIState.NORMAL.value == "NORMAL"
-    obs = KPIObservation(name="x", value=1.0, as_of="t")
+    obs = KPIObservation(name="x", value=1.0, as_of=datetime(2026, 1, 1, tzinfo=UTC))
     assert obs.value == 1.0
 
 

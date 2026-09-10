@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from metric_runtime.detectors import SeasonalZScore, Threshold
 from metric_runtime.models import (
     KPI,
@@ -72,7 +74,7 @@ def test_status_to_observation_and_detection():
         anomaly=True,
         support=100,
         support_ok=True,
-        as_of="t",
+        as_of=datetime(2026, 1, 1, tzinfo=UTC),
         directionality=Directionality.LOWER_IS_BAD,
         state=KPIState.DETECTED,
         severity=5.0,
@@ -91,7 +93,7 @@ def test_incident_backcompat_aliases():
         explanatory_kpi="basket_threshold_concentration",
         owner="Promotions",
         state=IncidentState.OPEN,
-        first_detected="t",
+        first_detected=datetime(2026, 1, 1, tzinfo=UTC),
         estimated_impact=120.0,
     )
     assert inc.kpi == "weekend_profit"
