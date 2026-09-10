@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from measures import Measure
-
 from metric_runtime.detectors import SeasonalZScore
 from metric_runtime.models import (
     Directionality,
@@ -10,6 +8,11 @@ from metric_runtime.models import (
     KPIDefinition,
     SupportRequirement,
 )
+
+try:
+    from .measures import Measure
+except ImportError:  # pragma: no cover - marimo local path import
+    from measures import Measure
 
 
 def build_catalog() -> dict[str, KPIDefinition]:

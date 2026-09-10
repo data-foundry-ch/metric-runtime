@@ -3,9 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from measures import Measure
-
 from metric_runtime.engine import KPIEngine
+
+try:
+    from .measures import Measure
+except ImportError:  # pragma: no cover - marimo local path import
+    from measures import Measure
 
 
 def campaign_impact_decomposition(
