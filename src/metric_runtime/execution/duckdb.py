@@ -28,8 +28,7 @@ def quote_identifier(name: str) -> str:
     """
     if not isinstance(name, str) or not _IDENT_RE.fullmatch(name):
         raise ValueError(
-            f"Invalid SQL identifier {name!r}. "
-            "Expected a name like 'orders' or 'gross_revenue'."
+            f"Invalid SQL identifier {name!r}. Expected a name like 'orders' or 'gross_revenue'."
         )
     return f'"{name}"'
 
@@ -236,9 +235,7 @@ class DuckDBExecutor:
         ]
 
     def latest_timestamp(self) -> datetime | None:
-        latest = self.con.execute(
-            f"SELECT MAX({self._ts_sql}) FROM {self._fact_sql}"
-        ).fetchone()[0]
+        latest = self.con.execute(f"SELECT MAX({self._ts_sql}) FROM {self._fact_sql}").fetchone()[0]
         if latest is None:
             return None
         if isinstance(latest, datetime):

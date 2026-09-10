@@ -102,8 +102,7 @@ def coerce_detector_spec(value: Any) -> Any:
             min_relative_change=cfg.min_relative_change,
         )
     raise TypeError(
-        f"detector must be a DetectorSpec (SeasonalZScore | Threshold), "
-        f"got {type(value)!r}"
+        f"detector must be a DetectorSpec (SeasonalZScore | Threshold), got {type(value)!r}"
     )
 
 

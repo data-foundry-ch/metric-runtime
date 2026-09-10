@@ -232,7 +232,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             # pages Promotions. In the graph it still reads as a mix slice,
             # so it is coloured by movement like its siblings.
             directionality=Directionality.HIGHER_IS_BAD,
-                        detector=SeasonalZScore(lookback_periods=6, threshold=1.8, min_relative_change=0.15),
+            detector=SeasonalZScore(lookback_periods=6, threshold=1.8, min_relative_change=0.15),
             support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
             impact=ImpactModel(kind="none"),
             unit="ratio",
