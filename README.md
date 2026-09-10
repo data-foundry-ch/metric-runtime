@@ -51,9 +51,17 @@ A metric-runtime KPI can know:
 - how it is calculated
 - what explains it
 - what dimensions are valid
-- how abnormality is detected
+- how abnormality is detected (serializable detector specs)
 - who owns it
 - its operational state
+
+Detector policies are JSON-safe specs. The engine builds the runtime strategy:
+
+```python
+encoded = profit_margin.model_dump_json()
+restored = KPI.model_validate_json(encoded)
+assert restored == profit_margin
+```
 
 ## Architecture
 

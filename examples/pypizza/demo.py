@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from metric_runtime.graph import build_business_graph, talk_subgraph
+from metric_runtime.graph import build_business_graph
 from metric_runtime.incidents import open_smart_incident
 from metric_runtime.investigation import (
     investigate_window as _investigate_window,
@@ -16,8 +16,10 @@ from metric_runtime.models import KPI, Incident, InvestigationResult
 
 try:
     from .catalog import TALK_GRAPH_METRICS
+    from .graph_layout import enrich_presentation_graph, talk_subgraph
 except ImportError:  # pragma: no cover - marimo local path import
     from catalog import TALK_GRAPH_METRICS
+    from graph_layout import enrich_presentation_graph, talk_subgraph
 
 PYPIZZA_PREFERRED_LEAVES = (
     "basket_threshold_concentration",
@@ -26,7 +28,8 @@ PYPIZZA_PREFERRED_LEAVES = (
 
 
 def build_talk_graph(catalog: dict[str, KPI]):
-    return talk_subgraph(build_business_graph(catalog), TALK_GRAPH_METRICS)
+    full = enrich_presentation_graph(build_business_graph(catalog), catalog)
+    return talk_subgraph(full, TALK_GRAPH_METRICS)
 
 
 def preferred_explanatory_path(result: InvestigationResult) -> list[str]:

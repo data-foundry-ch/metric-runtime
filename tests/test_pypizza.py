@@ -219,9 +219,9 @@ def test_pypizza_config_loader(engine: KPIEngine):
 
 def test_talk_graph_rings():
     cat = build_catalog()
-    assert cat["weekend_profit"].graph_ring == 0
-    assert cat["profit_margin"].graph_ring == 1
-    assert cat["basket_threshold_concentration"].graph_ring == 3
+    assert cat["weekend_profit"].presentation()["graph_ring"] == 0
+    assert cat["profit_margin"].presentation()["graph_ring"] == 1
+    assert cat["basket_threshold_concentration"].presentation()["graph_ring"] == 3
 
 
 def test_mark_root_candidates_smoke():

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from metric_runtime.detectors import SeasonalZScore, Threshold
 from metric_runtime.models import (
     KPI,
     Detection,
     Directionality,
+    Formula,
     Incident,
     IncidentState,
     KPIObservation,
@@ -17,6 +19,46 @@ from metric_runtime.models import (
 def test_kpi_display_name_default():
     k = KPI(name="profit_margin", owner="finance")
     assert k.display_name == "Profit Margin"
+
+
+def test_kpi_json_round_trip():
+    metric = KPI(
+        name="conversion_rate",
+        owner="growth",
+        formula=Formula.ratio("customers", "requests"),
+        dependencies=("customers", "requests"),
+        directionality=Directionality.LOWER_IS_BAD,
+        detector=SeasonalZScore(lookback_periods=6, threshold=3.0),
+        metadata={"presentation": {"graph_ring": 1, "graph_side": "marketing"}},
+    )
+    encoded = metric.model_dump_json()
+    restored = KPI.model_validate_json(encoded)
+    assert restored == metric
+    assert isinstance(restored.detector, SeasonalZScore)
+    assert restored.detector.threshold == 3.0
+
+
+def test_kpi_json_round_trip_threshold_detector():
+    metric = KPI(
+        name="error_rate",
+        owner="platform",
+        formula=Formula.ratio("errors", "requests"),
+        detector=Threshold(absolute_threshold=0.05, min_relative_change=0.0),
+    )
+    restored = KPI.model_validate_json(metric.model_dump_json())
+    assert restored == metric
+    assert isinstance(restored.detector, Threshold)
+
+
+def test_kpi_model_json_schema():
+    schema = KPI.model_json_schema()
+    assert schema["type"] == "object"
+    assert "name" in schema["properties"]
+    assert "detector" in schema["properties"]
+    assert "formula" in schema["properties"]
+    # Presentation layout is not a first-class KPI field.
+    assert "graph_ring" not in schema["properties"]
+    assert "graph_side" not in schema["properties"]
 
 
 def test_status_to_observation_and_detection():

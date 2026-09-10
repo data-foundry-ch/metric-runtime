@@ -29,6 +29,7 @@ def _():
     from metric_runtime import state as state_module
     from metric_runtime.detectors import (
         DetectorStrategy,
+        SeasonalZScore,
         SeasonalZScoreDetector,
         ThresholdDetector,
     )
@@ -45,7 +46,6 @@ def _():
         ImpactModel,
         IncidentState,
         KPIDefinition,
-        Measure,
         MetricState,
         SupportRequirement,
     )
@@ -55,6 +55,7 @@ def _():
     from demo import build_talk_graph, investigate_window, open_pypizza_incident, preferred_explanatory_path
     from formatters import money, metric_fmt, pct
     from impact import campaign_impact_decomposition
+    from measures import Measure
     from quality import check_data_quality
     from queries import basket_distribution
     from viz import PLOTLY_DISPLAY_CONFIG, build_plotly_network
@@ -74,6 +75,7 @@ def _():
         MetricState,
         PLOTLY_DISPLAY_CONFIG,
         Path,
+        SeasonalZScore,
         SeasonalZScoreDetector,
         StatePolicy,
         SupportRequirement,
@@ -658,6 +660,10 @@ def _(catalog, mo):
             "    )"
         )
     )
+    _det = _pm.detector
+    _pres = _pm.presentation()
+    _ring = _pres.get("graph_ring", 0)
+    _side = _pres.get("graph_side", "finance")
     kpi_definition_source = f'''metric = KPIDefinition(
     name="{_pm.name}",
     label="{_pm.label}",
@@ -669,16 +675,20 @@ def _(catalog, mo):
     ),
     dependencies={_pm.dependencies!r},
     directionality=Directionality.{_pm.directionality.name},
-    detector=DetectorConfig(
-        baseline_weeks={_pm.detector.baseline_weeks},
-        z_threshold={_pm.detector.z_threshold},
-        min_relative_change={_pm.detector.min_relative_change},
+    detector=SeasonalZScore(
+        lookback_periods={_det.lookback_periods},
+        threshold={_det.threshold},
+        min_relative_change={_det.min_relative_change},
     ),
     support={_support_src},
     impact=ImpactModel(kind="{_pm.impact.kind}"),
     unit="{_pm.unit}",
-    graph_ring={_pm.graph_ring},
-    graph_side="{_pm.graph_side}",
+    metadata={{
+        "presentation": {{
+            "graph_ring": {_ring},
+            "graph_side": "{_side}",
+        }}
+    }},
 )
 '''
     kpi_editor = mo.ui.code_editor(
@@ -697,13 +707,13 @@ def _(
     AMS_LUNCH,
     CAMPAIGN_END,
     CAMPAIGN_START,
-    DetectorConfig,
     Directionality,
     Formula,
     ImpactModel,
     KPIDefinition,
     KPIEngine,
     Measure,
+    SeasonalZScore,
     SupportRequirement,
     engine,
     kpi_editor,
@@ -717,7 +727,7 @@ def _(
         "Formula": Formula,
         "Measure": Measure,
         "Directionality": Directionality,
-        "DetectorConfig": DetectorConfig,
+        "SeasonalZScore": SeasonalZScore,
         "SupportRequirement": SupportRequirement,
         "ImpactModel": ImpactModel,
     }
@@ -733,13 +743,18 @@ def _(
             )
         _live_catalog = dict(engine.catalog)
         _live_catalog[_metric.name] = _metric
-        _live = KPIEngine(engine.con, _live_catalog)
+        _live = KPIEngine(
+            catalog=_live_catalog,
+            executor=engine.executor,
+            state_store=engine.state_store,
+        )
+        _det_cfg = _metric.detector.as_config()
         _status = _live.evaluate_window(
             _metric.name,
             CAMPAIGN_START,
             CAMPAIGN_END,
             AMS_LUNCH,
-            baseline_weeks=_metric.detector.baseline_weeks,
+            baseline_weeks=_det_cfg.baseline_weeks,
         )
     except Exception as exc:  # noqa: BLE001. show edit errors on the slide
         _error = exc
@@ -752,6 +767,7 @@ def _(
         assert _status is not None and _metric is not None
         _kind = "danger" if _status.anomaly else "success"
         _flag = "ANOMALY" if _status.anomaly else "within range"
+        _det_cfg = _metric.detector.as_config()
         _result = mo.callout(
             mo.md(
                 f"**Live detector · {_metric.name} · {_flag}**\n\n"
@@ -759,8 +775,8 @@ def _(
                 f" · expected **{metric_fmt(_status.baseline_mean, _metric.unit)}**"
                 f" · {pct(_status.relative_change)}\n\n"
                 f"z **{_status.z_score:+.2f}**"
-                f" · threshold **{_metric.detector.z_threshold}**"
-                f" · min Δ **{_metric.detector.min_relative_change:.0%}**\n\n"
+                f" · threshold **{_det_cfg.z_threshold}**"
+                f" · min Δ **{_det_cfg.min_relative_change:.0%}**\n\n"
                 f"support **{_status.support:,.0f}**"
                 f" (ok={_status.support_ok}"
                 + (
@@ -848,7 +864,7 @@ def _(mo, observations):
     # Stable UI element. keep separate so edits aren't wiped on re-run.
     _obs = observations["profit_margin"]
     _expected = sum(_obs["baseline"][:6]) / 6
-    _cfg = _obs["definition"].detector
+    _cfg = _obs["definition"].detector.as_config()
     detector_source = f'''# Same observations. Swap the strategy (and/or the thresholds).
 detector = SeasonalZScoreDetector()
 config = DetectorConfig(
