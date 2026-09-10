@@ -32,3 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `KPI.detector` is a typed serializable spec (`SeasonalZScore` | `Threshold`); runtime strategies are built via factory/registry
 - Presentation layout fields (`graph_ring` / `graph_side` / `graph_directionality`) moved out of core KPI into example `metadata["presentation"]`
 - DuckDB SQL generation validates and quotes identifiers
+- Authoritative ``KPIEngine.process`` / ``tick`` loop: observe → persist → state → investigate → incident → notify
+- Split observation / metric-state / incident store protocols (composed by ``StateStore``)
+- ``KPIStateTransition`` and resolve / acknowledge / suppress semantics
+- ``StatePolicy`` wired from ``metric-runtime.yaml`` into ``build_runtime``

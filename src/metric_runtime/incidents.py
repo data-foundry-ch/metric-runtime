@@ -5,14 +5,56 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from metric_runtime.investigation import investigate_metric, preferred_explanatory_path
-from metric_runtime.models import Incident, IncidentState, QualityReport
+from metric_runtime.models import Incident, IncidentState, InvestigationResult, QualityReport
 from metric_runtime.ownership import resolve_alert_owner
+
+
+def incident_from_investigation(
+    engine,
+    *,
+    center_kpi: str,
+    scope: dict[str, str],
+    at: datetime,
+    inv: InvestigationResult,
+    state: IncidentState,
+    first_detected: str,
+    estimated_impact: float,
+    persistence_windows: int = 1,
+    context: list[str] | None = None,
+    preferred_leaves: tuple[str, ...] = (),
+) -> Incident:
+    """Build an incident from an investigation result (no store I/O)."""
+    primary = inv.primary_explanatory
+    owner = resolve_alert_owner(engine.catalog_dict, primary, center_kpi)
+    path = preferred_explanatory_path(inv, preferred_leaves=preferred_leaves)
+    explanatory = primary.name if primary else center_kpi
+    suppressed = [n for n in path if n != explanatory]
+    roots = [c.name for c in inv.deepest_candidates]
+    opened = at.isoformat(sep=" ") if state == IncidentState.OPEN else None
+    return Incident(
+        primary_metric=center_kpi,
+        explanatory_kpi=explanatory,
+        root_candidates=roots,
+        scope=scope,
+        owner=owner,
+        state=state,
+        opened_at=opened,
+        updated_at=at.isoformat(sep=" "),
+        first_detected=first_detected,
+        estimated_impact=max(estimated_impact, inv.impact_eur),
+        evidence=list(path),
+        related_metrics=list(suppressed),
+        supporting_metrics=list(suppressed),
+        context=list(context or []),
+        persistence_windows=persistence_windows,
+        suppressed_ancestors=list(suppressed),
+    )
 
 
 def open_smart_incident(
     engine,
     *,
-    center_kpi: str = "weekend_profit",
+    center_kpi: str,
     scope: dict[str, str] | None = None,
     start: datetime,
     windows: int = 12,
@@ -27,6 +69,8 @@ def open_smart_incident(
     detector → state → graph traversal → deepest explanatory KPI → owner.
 
     One incident for the chain; ancestors listed as suppressed supporting evidence.
+
+    ``center_kpi`` is required — domain defaults belong in the example layer.
     """
     if quality is not None and not quality.healthy:
         return None
@@ -66,37 +110,26 @@ def open_smart_incident(
         scope,
         preferred_leaves=preferred_leaves,
     )
-    primary = inv.primary_explanatory
-    owner = resolve_alert_owner(engine.catalog_dict, primary, center_kpi)
-    path = preferred_explanatory_path(inv, preferred_leaves=preferred_leaves)
-    explanatory = primary.name if primary else center_kpi
-    suppressed = [n for n in path if n != explanatory]
-    roots = [c.name for c in inv.deepest_candidates]
-
     state = IncidentState.OPEN if open_at is not None else IncidentState.DETECTED
-    return Incident(
-        primary_metric=center_kpi,
-        explanatory_kpi=explanatory,
-        root_candidates=roots,
+    return incident_from_investigation(
+        engine,
+        center_kpi=center_kpi,
         scope=scope,
-        owner=owner,
+        at=investigate_at,
+        inv=inv,
         state=state,
-        opened_at=open_at.isoformat(sep=" ") if open_at else None,
         first_detected=first_detected.isoformat(sep=" "),
-        estimated_impact=max(last_impact, inv.impact_eur),
-        evidence=list(path),
-        related_metrics=list(suppressed),
-        supporting_metrics=list(suppressed),
-        context=list(context or []),
+        estimated_impact=last_impact,
         persistence_windows=consecutive,
-        suppressed_ancestors=list(suppressed),
+        context=context,
+        preferred_leaves=preferred_leaves,
     )
 
 
 def evaluate_watcher(
     engine,
     *,
-    kpi: str = "weekend_profit",
+    kpi: str,
     scope: dict[str, str] | None = None,
     start: datetime,
     interval_minutes: int = 30,

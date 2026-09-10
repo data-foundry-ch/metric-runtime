@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     field_validator,
     model_validator,
@@ -375,3 +376,31 @@ class Incident(BaseModel):
     @property
     def impact_eur(self) -> float:
         return self.estimated_impact
+
+
+class NotificationEvent(BaseModel):
+    """Record of a notification emitted by ``KPIEngine.process``."""
+
+    kind: Literal["incident_opened", "incident_updated", "incident_resolved", "state_changed"]
+    incident: Incident | None = None
+    metric: str = ""
+    previous_state: KPIState | None = None
+    current_state: KPIState | None = None
+    message: str = ""
+
+
+class ProcessResult(BaseModel):
+    """Outcome of one authoritative runtime tick."""
+
+    metric: str
+    scope: dict[str, str] = Field(default_factory=dict)
+    at: str
+    status: KPIStatus
+    transition: Any  # KPIStateTransition NamedTuple (previous, current)
+    new_incidents: list[Incident] = Field(default_factory=list)
+    updated_incidents: list[Incident] = Field(default_factory=list)
+    notifications: list[NotificationEvent] = Field(default_factory=list)
+    investigation: InvestigationResult | None = None
+    idempotent: bool = False
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)

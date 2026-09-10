@@ -217,6 +217,54 @@ def test_pypizza_config_loader(engine: KPIEngine):
     assert len(built.catalog) == len(engine.catalog)
 
 
+def test_pypizza_process_routes_single_incident(engine: KPIEngine):
+    from metric_runtime.notifications import RecordingNotifier
+    from metric_runtime.state import StatePolicy
+    from metric_runtime.stores.memory import InMemoryStateStore
+
+    notifier = RecordingNotifier()
+    runtime = KPIEngine(
+        catalog=engine.catalog,
+        executor=engine.executor,
+        state_store=InMemoryStateStore(),
+        notifier=notifier,
+        state_policy=StatePolicy(persistence=2, min_impact_eur=40.0),
+        preferred_leaves=(
+            "basket_threshold_concentration",
+            "discount_cost_per_order",
+        ),
+    )
+    scope = AMS_LUNCH
+    # Walk consecutive anomalous half-hours until OPEN.
+    open_result = None
+    for hour in (11, 12, 13):
+        for minute in (0, 30):
+            at = datetime(2026, 5, 15, hour, minute)
+            result = runtime.process(metric="weekend_profit", at=at, scope=scope)
+            if result.new_incidents:
+                open_result = result
+                break
+        if open_result is not None:
+            break
+    assert open_result is not None
+    assert open_result.transition.current == KPIState.OPEN
+    assert len(open_result.new_incidents) == 1
+    incident = open_result.new_incidents[0]
+    assert "Commercial Growth" in incident.owner or "Promotions" in incident.owner
+    assert incident.owner != "Finance" or incident.explanatory_kpi != "weekend_profit"
+    assert len(notifier.incidents) == 1
+
+    retry = runtime.process(
+        metric="weekend_profit",
+        at=datetime.fromisoformat(open_result.at.replace(" ", "T")),
+        scope=scope,
+    )
+    assert retry.new_incidents == []
+    assert retry.notifications == []
+    assert len(notifier.incidents) == 1
+    assert len(runtime.state_store.list_open_incidents()) == 1
+
+
 def test_talk_graph_rings():
     cat = build_catalog()
     assert cat["weekend_profit"].presentation()["graph_ring"] == 0

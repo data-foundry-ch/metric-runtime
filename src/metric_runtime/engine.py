@@ -17,10 +17,17 @@ from metric_runtime.models import (
     KPI,
     DetectorConfig,
     DrilldownRow,
+    IncidentState,
+    KPIState,
     KPIStatus,
     MeasureRef,
+    NotificationEvent,
+    ProcessResult,
+    QualityReport,
 )
 from metric_runtime.notifications.base import Notifier, NullNotifier
+from metric_runtime.state import KPIStateTransition, StatePolicy, evolve_state
+from metric_runtime.stores.base import canonical_scope_key
 from metric_runtime.stores.memory import InMemoryStateStore
 
 
@@ -53,6 +60,8 @@ class KPIEngine:
         *,
         connection=None,
         fact_table: str | None = None,
+        state_policy: StatePolicy | None = None,
+        preferred_leaves: tuple[str, ...] = (),
     ):
         if isinstance(catalog, KPICatalog):
             self._catalog = catalog
@@ -74,6 +83,8 @@ class KPIEngine:
         self.state_store = state_store or InMemoryStateStore()
         self.detector = detector or SeasonalZScoreDetector()
         self.notifier = notifier or NullNotifier()
+        self.state_policy = state_policy or StatePolicy()
+        self.preferred_leaves = preferred_leaves
 
         # Convenience attributes used by example quality helpers.
         self.fact_table = getattr(executor, "fact_table", fact_table)
@@ -332,6 +343,7 @@ class KPIEngine:
     ):
         from metric_runtime.investigation import investigate_metric, investigate_window
 
+        leaves = preferred_leaves or self.preferred_leaves
         if start is not None and end is not None:
             return investigate_window(
                 self,
@@ -339,8 +351,247 @@ class KPIEngine:
                 start,
                 end,
                 filters,
-                preferred_leaves=preferred_leaves,
+                preferred_leaves=leaves,
             )
         if at is None:
             raise MetricRuntimeError("investigate() requires at= or start=/end=")
-        return investigate_metric(self, metric, at, filters, preferred_leaves=preferred_leaves)
+        return investigate_metric(self, metric, at, filters, preferred_leaves=leaves)
+
+    def acknowledge(
+        self,
+        metric: str,
+        scope: dict[str, str] | None = None,
+        *,
+        at: datetime | None = None,
+    ) -> KPIState:
+        """Explicit human acknowledgement — sticky while the anomaly persists."""
+        scope = dict(scope or {})
+        key = canonical_scope_key(scope)
+        self.state_store.set_state(metric, KPIState.ACKNOWLEDGED, key)
+        active = self.state_store.find_active_incident(metric, key)
+        if active is not None:
+            stamp = (at or datetime.now()).isoformat(sep=" ")
+            updated = active.model_copy(
+                update={"state": IncidentState.ACKNOWLEDGED, "updated_at": stamp}
+            )
+            self.state_store.upsert_incident(updated)
+        return KPIState.ACKNOWLEDGED
+
+    def process(
+        self,
+        metric: str,
+        *,
+        at: datetime | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        scope: dict[str, str] | None = None,
+        quality: QualityReport | None = None,
+        preferred_leaves: tuple[str, ...] = (),
+        context: list[str] | None = None,
+    ) -> ProcessResult:
+        """Authoritative runtime tick: observe → persist → state → incident → notify.
+
+        Idempotent per metric + scope + evaluation window (``at`` or ``start``/``end``).
+        """
+        from metric_runtime.incidents import incident_from_investigation
+
+        scope = dict(scope or {})
+        key = canonical_scope_key(scope)
+        leaves = preferred_leaves or self.preferred_leaves
+        policy = self.state_policy
+
+        if start is not None and end is not None:
+            status = self.evaluate_window(metric, start, end, scope)
+            window_id = status.as_of
+            eval_at = end
+        elif at is not None:
+            status = self.evaluate(metric, at, scope)
+            window_id = status.as_of
+            eval_at = at
+        else:
+            raise MetricRuntimeError("process() requires at= or start=/end=")
+
+        previous = self.state_store.get_state(metric, key)
+        already = self.state_store.has_observation(metric, window_id, key)
+        if already:
+            current = self.state_store.get_state(metric, key)
+            return ProcessResult(
+                metric=metric,
+                scope=scope,
+                at=window_id,
+                status=status,
+                transition=KPIStateTransition(previous, current),
+                idempotent=True,
+            )
+
+        self.state_store.append_observation(metric, status, key)
+        history = self.state_store.get_history(metric, key)
+        impact = self.estimate_impact_eur(
+            metric, eval_at, status.value, status.baseline_mean, scope
+        )
+
+        current = evolve_state(
+            history,
+            policy=policy,
+            impact_eur=impact,
+            quality=quality,
+            previous=previous,
+        )
+
+        # Cooldown: stay RESOLVED briefly after resolution even if anomaly returns.
+        if previous == KPIState.RESOLVED and current in {
+            KPIState.DETECTED,
+            KPIState.OPEN,
+        }:
+            resolved_at = getattr(self.state_store, "get_resolved_at", lambda *_a, **_k: None)(
+                metric, key
+            )
+            if resolved_at is not None:
+                try:
+                    delta = eval_at - resolved_at
+                except TypeError:
+                    delta = timedelta(0)
+                if delta < timedelta(minutes=policy.cooldown_minutes):
+                    current = KPIState.RESOLVED
+
+        self.state_store.set_state(metric, current, key)
+        if current == KPIState.RESOLVED:
+            setter = getattr(self.state_store, "set_resolved_at", None)
+            if callable(setter):
+                setter(metric, key, eval_at)
+
+        transition = KPIStateTransition(previous, current)
+        new_incidents: list = []
+        updated_incidents: list = []
+        notifications: list[NotificationEvent] = []
+        investigation = None
+
+        active = self.state_store.find_active_incident(metric, key)
+
+        if current == KPIState.OPEN:
+            investigation = self.investigate(
+                metric, at=eval_at, filters=scope, preferred_leaves=leaves
+            )
+            draft = incident_from_investigation(
+                self,
+                center_kpi=metric,
+                scope=scope,
+                at=eval_at,
+                inv=investigation,
+                state=IncidentState.OPEN,
+                first_detected=(
+                    active.first_detected
+                    if active is not None
+                    else next(
+                        (h.as_of for h in history if h.anomaly and h.support_ok),
+                        window_id,
+                    )
+                ),
+                estimated_impact=impact,
+                persistence_windows=policy.persistence,
+                context=context,
+                preferred_leaves=leaves,
+            )
+            if active is None:
+                stored = self.state_store.upsert_incident(draft)
+                new_incidents.append(stored)
+                event = NotificationEvent(
+                    kind="incident_opened",
+                    incident=stored,
+                    metric=metric,
+                    previous_state=previous,
+                    current_state=current,
+                    message=f"Opened incident for {metric}",
+                )
+                notifications.append(event)
+                self.notifier.notify(stored)
+            else:
+                merged = draft.model_copy(
+                    update={
+                        "id": active.id,
+                        "first_detected": active.first_detected,
+                        "opened_at": active.opened_at or draft.opened_at,
+                        "state": IncidentState.OPEN,
+                    }
+                )
+                # Only notify on meaningful incident field changes while OPEN.
+                meaningful = (
+                    previous != current
+                    or active.explanatory_kpi != merged.explanatory_kpi
+                    or active.owner != merged.owner
+                    or active.state != IncidentState.OPEN
+                )
+                stored = self.state_store.upsert_incident(merged)
+                updated_incidents.append(stored)
+                if meaningful and previous != current:
+                    event = NotificationEvent(
+                        kind="incident_updated",
+                        incident=stored,
+                        metric=metric,
+                        previous_state=previous,
+                        current_state=current,
+                        message=f"Updated incident for {metric}",
+                    )
+                    notifications.append(event)
+                    self.notifier.notify(stored)
+
+        elif current == KPIState.RESOLVED and active is not None:
+            resolved = active.model_copy(
+                update={
+                    "state": IncidentState.RESOLVED,
+                    "updated_at": eval_at.isoformat(sep=" "),
+                }
+            )
+            stored = self.state_store.upsert_incident(resolved)
+            updated_incidents.append(stored)
+            if previous != current:
+                event = NotificationEvent(
+                    kind="incident_resolved",
+                    incident=stored,
+                    metric=metric,
+                    previous_state=previous,
+                    current_state=current,
+                    message=f"Resolved incident for {metric}",
+                )
+                notifications.append(event)
+                self.notifier.notify(stored)
+
+        elif current == KPIState.SUPPRESSED and previous != current:
+            event = NotificationEvent(
+                kind="state_changed",
+                metric=metric,
+                previous_state=previous,
+                current_state=current,
+                message=f"Suppressed {metric} due to data quality",
+            )
+            notifications.append(event)
+            if active is not None:
+                suppressed = active.model_copy(
+                    update={
+                        "state": IncidentState.SUPPRESSED,
+                        "updated_at": eval_at.isoformat(sep=" "),
+                    }
+                )
+                stored = self.state_store.upsert_incident(suppressed)
+                updated_incidents.append(stored)
+                self.notifier.notify(stored)
+
+        elif current == KPIState.DETECTED and previous == KPIState.NORMAL and active is None:
+            # Detection alone is not an alert — no notification.
+            pass
+
+        return ProcessResult(
+            metric=metric,
+            scope=scope,
+            at=window_id,
+            status=status,
+            transition=transition,
+            new_incidents=new_incidents,
+            updated_incidents=updated_incidents,
+            notifications=notifications,
+            investigation=investigation,
+            idempotent=False,
+        )
+
+    # Alias used by schedulers / workers.
+    tick = process

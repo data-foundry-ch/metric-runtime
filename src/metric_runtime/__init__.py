@@ -22,7 +22,9 @@ from metric_runtime.models import (
     KPIObservation,
     KPIState,
     KPIStatus,
+    ProcessResult,
 )
+from metric_runtime.state import KPIStateTransition, StatePolicy
 from metric_runtime.stores import InMemoryStateStore
 
 __all__ = [
@@ -31,10 +33,12 @@ __all__ = [
     "KPIEngine",
     "KPIObservation",
     "KPIState",
+    "KPIStateTransition",
     "KPIStatus",
     "Detection",
     "Incident",
     "InvestigationResult",
+    "ProcessResult",
     "Directionality",
     "Formula",
     "SeasonalZScore",
@@ -42,6 +46,7 @@ __all__ = [
     "Threshold",
     "ThresholdDetector",
     "InMemoryStateStore",
+    "StatePolicy",
     "investigate_metric",
     "investigate_window",
     "open_smart_incident",
