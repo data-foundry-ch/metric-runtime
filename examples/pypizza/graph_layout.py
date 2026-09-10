@@ -5,6 +5,32 @@ from collections import defaultdict
 
 import networkx as nx
 
+from metric_runtime.models import KPI
+
+
+def enrich_presentation_graph(
+    graph: nx.DiGraph,
+    catalog: dict[str, KPI],
+) -> nx.DiGraph:
+    """Attach PyPizza layout hints from KPI.metadata['presentation']."""
+    for name, metric in catalog.items():
+        if name not in graph:
+            continue
+        presentation = metric.presentation()
+        ring = presentation.get("graph_ring")
+        side = presentation.get("graph_side")
+        graph_directionality = presentation.get("graph_directionality")
+        if ring is not None:
+            graph.nodes[name]["graph_ring"] = ring
+        if side is not None:
+            graph.nodes[name]["graph_side"] = side
+        if graph_directionality is not None:
+            value = getattr(graph_directionality, "value", graph_directionality)
+            graph.nodes[name]["graph_directionality"] = str(value)
+        else:
+            graph.nodes[name]["graph_directionality"] = metric.directionality.value
+    return graph
+
 
 def dependency_depths(
     graph: nx.DiGraph,

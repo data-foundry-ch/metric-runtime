@@ -11,9 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Executable Pydantic KPI semantic model (`KPI`)
 - Generic measure references + `Formula.sum` / `Formula.ratio` / `Formula.difference`
-- Per-KPI detector instances (`SeasonalZScore`, `Threshold`) with engine-level default
+- Per-KPI detector specs (`SeasonalZScore`, `Threshold`) with engine-level runtime default
 - `KPICatalog` with dependency and cycle validation
-- Pluggable detectors (`SeasonalZScoreDetector`, `ThresholdDetector`)
+- Pluggable runtime detectors (`SeasonalZScoreDetector`, `ThresholdDetector`)
+- KPI JSON round-trip (`model_dump_json` / `model_validate_json`) without arbitrary types
 - KPI state machine (NORMAL → DETECTED → OPEN → …)
 - Semantic dependency graph (NetworkX) and graph-aware investigation
 - Incident model with ownership routing helpers
@@ -28,3 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Core package no longer ships a domain `Measure` enum or PyPizza warehouse defaults
 - Support gates require an explicit `SupportRequirement` (no implicit `orders` column)
+- `KPI.detector` is a typed serializable spec (`SeasonalZScore` | `Threshold`); runtime strategies are built via factory/registry
+- Presentation layout fields (`graph_ring` / `graph_side` / `graph_directionality`) moved out of core KPI into example `metadata["presentation"]`
+- DuckDB SQL generation validates and quotes identifiers

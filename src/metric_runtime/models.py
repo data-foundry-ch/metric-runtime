@@ -8,7 +8,6 @@ from typing import Any, Literal
 
 from pydantic import (
     BaseModel,
-    ConfigDict,
     Field,
     field_validator,
     model_validator,
@@ -109,10 +108,11 @@ class Formula(BaseModel):
 
 
 class DetectorConfig(BaseModel):
-    """Parameters consumed by detector implementations.
+    """Runtime parameters consumed by detector implementations.
 
-    The z-score is one detector implementation, not the architecture.
-    Prefer attaching a detector instance on the KPI when possible.
+    Prefer attaching a serializable detector spec on the KPI
+    (``SeasonalZScore`` / ``Threshold``). ``DetectorConfig`` remains the
+    parameter bag passed into ``DetectorStrategy.evaluate``.
     """
 
     baseline_weeks: int = Field(default=6, ge=3, le=12)
@@ -141,14 +141,21 @@ class ImpactModel(BaseModel):
     ] = "none"
 
 
+def _default_detector_spec() -> Any:
+    from metric_runtime.detectors.specs import SeasonalZScore
+
+    return SeasonalZScore()
+
+
 class KPI(BaseModel):
     """Executable semantic object for a business metric.
 
     A KPI says what the metric means. The runtime profile says where it
     is evaluated.
-    """
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    Presentation / layout hints belong in ``metadata`` (or the example
+    layer), not as first-class core fields.
+    """
 
     name: str
     label: str | None = None
@@ -158,16 +165,18 @@ class KPI(BaseModel):
     dimensions: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
     directionality: Directionality = Directionality.TWO_SIDED
-    # DetectorStrategy instance, DetectorConfig, or None (engine default).
-    detector: Any = Field(default_factory=DetectorConfig)
+    detector: Any = Field(default_factory=_default_detector_spec)
     support: SupportRequirement | None = None
     impact: ImpactModel = Field(default_factory=ImpactModel)
     unit: Literal["count", "ratio", "eur", "percent", "unit"] = "unit"
     metadata: dict[str, Any] = Field(default_factory=dict)
-    # Presentation hints used by examples; ignored by core investigation.
-    graph_ring: int = 0
-    graph_side: Literal["center", "marketing", "finance", "operations"] | None = None
-    graph_directionality: Directionality | Literal["neutral"] | None = None
+
+    @field_validator("detector", mode="before")
+    @classmethod
+    def _coerce_detector(cls, value: Any) -> Any:
+        from metric_runtime.detectors.specs import coerce_detector_spec
+
+        return coerce_detector_spec(value)
 
     @model_validator(mode="after")
     def _defaults(self) -> KPI:
@@ -178,6 +187,11 @@ class KPI(BaseModel):
     @property
     def display_name(self) -> str:
         return self.label or self.name
+
+    def presentation(self) -> dict[str, Any]:
+        """Optional example/presentation hints stored under metadata."""
+        raw = self.metadata.get("presentation")
+        return dict(raw) if isinstance(raw, dict) else {}
 
 
 # Back-compat alias.

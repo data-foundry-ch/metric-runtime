@@ -15,6 +15,20 @@ except ImportError:  # pragma: no cover - marimo local path import
     from measures import Measure
 
 
+def _presentation(
+    ring: int,
+    side: str,
+    *,
+    graph_directionality: str | Directionality | None = None,
+) -> dict:
+    """PyPizza talk-layout hints (not part of core KPI semantics)."""
+    presentation: dict = {"graph_ring": ring, "graph_side": side}
+    if graph_directionality is not None:
+        value = getattr(graph_directionality, "value", graph_directionality)
+        presentation["graph_directionality"] = value
+    return {"presentation": presentation}
+
+
 def build_catalog() -> dict[str, KPIDefinition]:
     """
     Semantic business network for the Great Lunch talk.
@@ -66,8 +80,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.ORDERS, minimum=40),
             impact=ImpactModel(kind="margin_delta"),
             unit="eur",
-            graph_ring=0,
-            graph_side="center",
+            metadata=_presentation(0, "center"),
         ),
         # ── Marketing trunk (left) ────────────────────────────────────────
         KPIDefinition(
@@ -83,8 +96,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.ORDERS, minimum=30),
             impact=ImpactModel(kind="revenue_delta"),
             unit="eur",
-            graph_ring=1,
-            graph_side="marketing",
+            metadata=_presentation(1, "marketing"),
         ),
         KPIDefinition(
             name="orders",
@@ -99,8 +111,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.ORDERS, minimum=30),
             impact=ImpactModel(kind="orders_delta"),
             unit="count",
-            graph_ring=2,
-            graph_side="marketing",
+            metadata=_presentation(2, "marketing"),
         ),
         KPIDefinition(
             name="opportunities",
@@ -115,8 +126,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.OPPORTUNITIES, minimum=40),
             impact=ImpactModel(kind="none"),
             unit="count",
-            graph_ring=3,
-            graph_side="marketing",
+            metadata=_presentation(3, "marketing"),
         ),
         KPIDefinition(
             name="marketing_leads",
@@ -131,8 +141,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.LEADS, minimum=50),
             impact=ImpactModel(kind="none"),
             unit="count",
-            graph_ring=3,
-            graph_side="marketing",
+            metadata=_presentation(3, "marketing"),
         ),
         KPIDefinition(
             name="new_customers",
@@ -147,8 +156,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.NEW_CUSTOMER_ORDERS, minimum=20),
             impact=ImpactModel(kind="none"),
             unit="count",
-            graph_ring=3,
-            graph_side="marketing",
+            metadata=_presentation(3, "marketing"),
         ),
         # ── Finance trunk (right) ─────────────────────────────────────────
         KPIDefinition(
@@ -164,8 +172,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.ORDERS, minimum=40),
             impact=ImpactModel(kind="margin_delta"),
             unit="ratio",
-            graph_ring=1,
-            graph_side="finance",
+            metadata=_presentation(1, "finance"),
         ),
         KPIDefinition(
             name="average_order_value",
@@ -187,8 +194,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.ORDERS, minimum=30),
             impact=ImpactModel(kind="none"),
             unit="eur",
-            graph_ring=2,
-            graph_side="finance",
+            metadata=_presentation(2, "finance"),
         ),
         KPIDefinition(
             name="average_cost_per_order",
@@ -209,8 +215,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.ORDERS, minimum=30),
             impact=ImpactModel(kind="cost_delta"),
             unit="eur",
-            graph_ring=2,
-            graph_side="finance",
+            metadata=_presentation(2, "finance"),
         ),
         KPIDefinition(
             name="basket_threshold_concentration",
@@ -227,13 +232,11 @@ def build_catalog() -> dict[str, KPIDefinition]:
             # pages Promotions. In the graph it still reads as a mix slice,
             # so it is coloured by movement like its siblings.
             directionality=Directionality.HIGHER_IS_BAD,
-            graph_directionality=Directionality.TWO_SIDED,
             detector=SeasonalZScore(lookback_periods=6, threshold=1.8, min_relative_change=0.15),
             support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
             impact=ImpactModel(kind="none"),
             unit="ratio",
-            graph_ring=3,
-            graph_side="finance",
+            metadata=_presentation(3, "finance", graph_directionality=Directionality.TWO_SIDED),
         ),
         *(
             KPIDefinition(
@@ -255,8 +258,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
                 support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
                 impact=ImpactModel(kind="none"),
                 unit="ratio",
-                graph_ring=3,
-                graph_side="finance",
+                metadata=_presentation(3, "finance"),
             )
             for _slug, _band_label, _measure in (
                 ("under_20", "under €20", Measure.BAND_UNDER_20_ORDERS),
@@ -278,8 +280,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
             impact=ImpactModel(kind="cost_delta"),
             unit="eur",
-            graph_ring=3,
-            graph_side="finance",
+            metadata=_presentation(3, "finance"),
         ),
         KPIDefinition(
             name="delivery_cost_per_order",
@@ -294,8 +295,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
             impact=ImpactModel(kind="cost_delta"),
             unit="eur",
-            graph_ring=3,
-            graph_side="finance",
+            metadata=_presentation(3, "finance"),
         ),
         # ── Operations trunk (bottom). holistic context, yellow warnings ─
         KPIDefinition(
@@ -311,9 +311,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.ORDERS, minimum=30),
             impact=ImpactModel(kind="none"),
             unit="count",
-            graph_ring=1,
-            graph_side="operations",
-            graph_directionality="neutral",
+            metadata=_presentation(1, "operations", graph_directionality="neutral"),
         ),
         KPIDefinition(
             name="late_delivery_rate",
@@ -328,9 +326,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
             impact=ImpactModel(kind="none"),
             unit="ratio",
-            graph_ring=2,
-            graph_side="operations",
-            graph_directionality="neutral",
+            metadata=_presentation(2, "operations", graph_directionality="neutral"),
         ),
         # ── Off-talk helpers (still in catalog, not in talk graph) ────────
         KPIDefinition(
@@ -346,8 +342,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
             impact=ImpactModel(kind="cost_delta"),
             unit="eur",
-            graph_ring=3,
-            graph_side="finance",
+            metadata=_presentation(3, "finance"),
         ),
         KPIDefinition(
             name="restaurant_leads",
@@ -365,8 +360,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.RESTAURANT_LEADS, minimum=5),
             impact=ImpactModel(kind="none"),
             unit="count",
-            graph_ring=2,
-            graph_side="marketing",
+            metadata=_presentation(2, "marketing"),
         ),
         KPIDefinition(
             name="conversion_rate",
@@ -381,8 +375,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.SESSIONS, minimum=80),
             impact=ImpactModel(kind="none"),
             unit="ratio",
-            graph_ring=4,
-            graph_side="marketing",
+            metadata=_presentation(4, "marketing"),
         ),
         KPIDefinition(
             name="promo_redemption_rate",
@@ -397,8 +390,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
             impact=ImpactModel(kind="none"),
             unit="ratio",
-            graph_ring=4,
-            graph_side="finance",
+            metadata=_presentation(4, "finance"),
         ),
     ]
     return {m.name: m for m in metrics}

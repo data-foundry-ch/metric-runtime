@@ -11,7 +11,7 @@ from pathlib import Path
 
 from metric_runtime.catalog import KPICatalog
 from metric_runtime.detectors import DetectorStrategy, SeasonalZScoreDetector
-from metric_runtime.detectors.base import DetectorStrategy as _DetectorStrategy
+from metric_runtime.detectors.specs import build_detector
 from metric_runtime.exceptions import MetricRuntimeError, UnknownMetricError
 from metric_runtime.models import (
     KPI,
@@ -30,21 +30,14 @@ def _resolve_detector(
 ) -> tuple[DetectorStrategy, DetectorConfig]:
     """Return (strategy, config) for a KPI.
 
-    - DetectorStrategy instance on the KPI → use it (per-KPI detector)
-    - DetectorConfig on the KPI → engine default strategy + that config
-    - None / missing → engine default + default config
+    KPI.detector is a serializable DetectorSpec (SeasonalZScore | Threshold).
+    The engine builds the runtime DetectorStrategy via the registry/factory.
     """
     configured = metric.detector
-    if isinstance(configured, _DetectorStrategy):
-        return configured, configured.as_config()
-    if isinstance(configured, DetectorConfig):
-        return engine_default, configured
     if configured is None:
         return engine_default, engine_default.as_config()
-    raise MetricRuntimeError(
-        f"KPI {metric.name!r} detector must be a DetectorStrategy or DetectorConfig, "
-        f"got {type(configured)!r}"
-    )
+    strategy = build_detector(configured)
+    return strategy, strategy.as_config()
 
 
 class KPIEngine:

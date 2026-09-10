@@ -1,7 +1,7 @@
 """Business semantic dependency graph.
 
 This is a BUSINESS semantic graph, not technical lineage.
-Graph visualization belongs in the example/presentation layer.
+Graph visualization / presentation layout belongs in the example layer.
 """
 
 from __future__ import annotations
@@ -27,13 +27,6 @@ def build_business_graph(catalog: dict[str, KPI]) -> nx.DiGraph:
             description=metric.description,
             unit=metric.unit,
             directionality=metric.directionality.value,
-            graph_directionality=str(
-                getattr(metric.graph_directionality, "value", None)
-                or metric.graph_directionality
-                or metric.directionality.value
-            ),
-            graph_ring=metric.graph_ring,
-            graph_side=metric.graph_side,
         )
     for name, metric in catalog.items():
         for dep in metric.dependencies:
@@ -135,18 +128,3 @@ def descendants(graph: nx.DiGraph, metric: str) -> set[str]:
     if metric not in graph:
         return set()
     return set(nx.descendants(graph, metric))
-
-
-def talk_subgraph(
-    full: nx.DiGraph,
-    metric_names: tuple[str, ...],
-) -> nx.DiGraph:
-    g = nx.DiGraph()
-    keep = set(metric_names)
-    for n in keep:
-        if n in full:
-            g.add_node(n, **full.nodes[n])
-    for u, v in full.edges:
-        if u in keep and v in keep:
-            g.add_edge(u, v)
-    return g

@@ -175,8 +175,7 @@ class SeasonalZScoreDetector(DetectorStrategy):
         )
 
 
-# Friendly / back-compat aliases.
-SeasonalZScore = SeasonalZScoreDetector
+# Back-compat alias used by older imports / talk slides.
 SeasonalBaselineDetector = SeasonalZScoreDetector
 
 
@@ -257,6 +256,3 @@ class ThresholdDetector(DetectorStrategy):
             state=KPIState.DETECTED if anomaly else KPIState.NORMAL,
             severity=_severity(z_score, relative_change) if anomaly else 0.0,
         )
-
-
-Threshold = ThresholdDetector
