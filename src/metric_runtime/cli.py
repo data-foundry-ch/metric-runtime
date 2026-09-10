@@ -195,9 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_show = sub.add_parser("config", help="Inspect configuration", parents=[shared])
     config_sub = p_show.add_subparsers(dest="config_command", required=True)
-    show = config_sub.add_parser(
-        "show", help="Show resolved non-secret config", parents=[shared]
-    )
+    show = config_sub.add_parser("show", help="Show resolved non-secret config", parents=[shared])
     show.set_defaults(func=_cmd_config_show)
 
     p_val = sub.add_parser(
@@ -207,9 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_conn = sub.add_parser("connections", help="Connection operations", parents=[shared])
     conn_sub = p_conn.add_subparsers(dest="connections_command", required=True)
-    test = conn_sub.add_parser(
-        "test", help="Test connectivity for a profile", parents=[shared]
-    )
+    test = conn_sub.add_parser("test", help="Test connectivity for a profile", parents=[shared])
     test.set_defaults(func=_cmd_connections_test)
 
     p_run = sub.add_parser("run", help="Build runtime from profile", parents=[shared])
@@ -217,9 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--at", default=None, help="ISO timestamp for --evaluate")
     p_run.set_defaults(func=_cmd_run)
 
-    p_eval = sub.add_parser(
-        "evaluate", help="Evaluate a KPI via profile", parents=[shared]
-    )
+    p_eval = sub.add_parser("evaluate", help="Evaluate a KPI via profile", parents=[shared])
     p_eval.add_argument("metric")
     p_eval.add_argument("--at", required=True)
     p_eval.set_defaults(func=_cmd_evaluate)
