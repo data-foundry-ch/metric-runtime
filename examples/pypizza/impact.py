@@ -3,8 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
+from measures import Measure
+
 from metric_runtime.engine import KPIEngine
-from metric_runtime.models import Measure
 
 
 def campaign_impact_decomposition(

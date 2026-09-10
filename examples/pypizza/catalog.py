@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from measures import Measure
+
+from metric_runtime.detectors import SeasonalZScore
 from metric_runtime.models import (
-    DetectorConfig,
     Directionality,
     Formula,
     ImpactModel,
     KPIDefinition,
-    Measure,
     SupportRequirement,
 )
 
@@ -37,11 +38,11 @@ def build_catalog() -> dict[str, KPIDefinition]:
         "channel",
         "campaign",
     )
-    seasonal = DetectorConfig(baseline_weeks=6, z_threshold=2.2, min_relative_change=0.06)
-    sharp = DetectorConfig(baseline_weeks=6, z_threshold=2.0, min_relative_change=0.10)
+    seasonal = SeasonalZScore(lookback_periods=6, threshold=2.2, min_relative_change=0.06)
+    sharp = SeasonalZScore(lookback_periods=6, threshold=2.0, min_relative_change=0.10)
     # Weekend lunch is lower volume, so the outcome metric gets a slightly
     # lower z bar. otherwise a real profit hit hides inside Friday's noise.
-    outcome = DetectorConfig(baseline_weeks=6, z_threshold=2.0, min_relative_change=0.06)
+    outcome = SeasonalZScore(lookback_periods=6, threshold=2.0, min_relative_change=0.06)
 
     metrics = [
         # ── Center ────────────────────────────────────────────────────────
@@ -53,7 +54,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
                 "(net revenue − restaurant payout − delivery − payment − discount)."
             ),
             owner="Finance",
-            formula=Formula(kind="sum", measure=Measure.WEEKEND_PROFIT),
+            formula=Formula.sum(Measure.WEEKEND_PROFIT),
             dimensions=dims,
             # One trunk per side. no multi-parent hairball.
             dependencies=("revenue", "profit_margin", "average_delivery_time"),
@@ -71,7 +72,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Revenue",
             description="Gross order value before discounts.",
             owner="Commercial",
-            formula=Formula(kind="sum", measure=Measure.GROSS_ORDER_VALUE),
+            formula=Formula.sum(Measure.GROSS_ORDER_VALUE),
             dimensions=dims,
             dependencies=("orders",),
             directionality=Directionality.TWO_SIDED,
@@ -87,7 +88,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Orders",
             description="Completed food-delivery orders.",
             owner="Growth",
-            formula=Formula(kind="sum", measure=Measure.ORDERS),
+            formula=Formula.sum(Measure.ORDERS),
             dimensions=dims,
             dependencies=("opportunities", "new_customers", "marketing_leads"),
             directionality=Directionality.TWO_SIDED,
@@ -103,11 +104,11 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Opportunities",
             description=("High-intent ordering opportunities (qualified demand)."),
             owner="Growth",
-            formula=Formula(kind="sum", measure=Measure.OPPORTUNITIES),
+            formula=Formula.sum(Measure.OPPORTUNITIES),
             dimensions=dims,
             dependencies=(),
             directionality=Directionality.TWO_SIDED,
-            detector=DetectorConfig(baseline_weeks=6, z_threshold=3.2, min_relative_change=0.18),
+            detector=SeasonalZScore(lookback_periods=6, threshold=3.2, min_relative_change=0.18),
             support=SupportRequirement(measure=Measure.OPPORTUNITIES, minimum=40),
             impact=ImpactModel(kind="none"),
             unit="count",
@@ -119,11 +120,11 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Marketing Leads",
             description="Top-of-funnel acquisition leads into the ordering funnel.",
             owner="Growth",
-            formula=Formula(kind="sum", measure=Measure.LEADS),
+            formula=Formula.sum(Measure.LEADS),
             dimensions=dims,
             dependencies=(),
             directionality=Directionality.TWO_SIDED,
-            detector=DetectorConfig(baseline_weeks=6, z_threshold=3.2, min_relative_change=0.18),
+            detector=SeasonalZScore(lookback_periods=6, threshold=3.2, min_relative_change=0.18),
             support=SupportRequirement(measure=Measure.LEADS, minimum=50),
             impact=ImpactModel(kind="none"),
             unit="count",
@@ -135,7 +136,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="New Customers",
             description="Orders from first-time customers. Marketing's acquisition win.",
             owner="Growth",
-            formula=Formula(kind="sum", measure=Measure.NEW_CUSTOMER_ORDERS),
+            formula=Formula.sum(Measure.NEW_CUSTOMER_ORDERS),
             dimensions=dims,
             dependencies=(),
             directionality=Directionality.TWO_SIDED,
@@ -152,11 +153,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Profit Margin",
             description="Weekend profit divided by revenue.",
             owner="Finance / Commercial Strategy",
-            formula=Formula(
-                kind="ratio",
-                numerator=Measure.WEEKEND_PROFIT,
-                denominator=Measure.GROSS_ORDER_VALUE,
-            ),
+            formula=Formula.ratio(Measure.WEEKEND_PROFIT, Measure.GROSS_ORDER_VALUE),
             dimensions=dims,
             dependencies=("average_order_value", "average_cost_per_order"),
             directionality=Directionality.LOWER_IS_BAD,
@@ -172,11 +169,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Average Order Size",
             description="Gross order value per completed order.",
             owner="Commercial Growth",
-            formula=Formula(
-                kind="ratio",
-                numerator=Measure.GROSS_ORDER_VALUE,
-                denominator=Measure.ORDERS,
-            ),
+            formula=Formula.ratio(Measure.GROSS_ORDER_VALUE, Measure.ORDERS),
             dimensions=dims,
             # The full basket mix. average order size is just its centre.
             dependencies=(
@@ -202,11 +195,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
                 "processing (excludes restaurant payout)."
             ),
             owner="Commercial Operations",
-            formula=Formula(
-                kind="ratio",
-                numerator=Measure.PLATFORM_COST,
-                denominator=Measure.ORDERS,
-            ),
+            formula=Formula.ratio(Measure.PLATFORM_COST, Measure.ORDERS),
             dimensions=dims,
             dependencies=(
                 "discount_cost_per_order",
@@ -228,11 +217,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
                 "Great Lunch €20 eligibility cliff."
             ),
             owner="Commercial Growth / Promotions",
-            formula=Formula(
-                kind="ratio",
-                numerator=Measure.THRESHOLD_BAND_ORDERS,
-                denominator=Measure.ORDERS,
-            ),
+            formula=Formula.ratio(Measure.THRESHOLD_BAND_ORDERS, Measure.ORDERS),
             dimensions=dims,
             dependencies=(),
             # The one band with a direction: piling up on the cliff is what
@@ -240,7 +225,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             # so it is coloured by movement like its siblings.
             directionality=Directionality.HIGHER_IS_BAD,
             graph_directionality=Directionality.TWO_SIDED,
-            detector=DetectorConfig(baseline_weeks=6, z_threshold=1.8, min_relative_change=0.15),
+            detector=SeasonalZScore(lookback_periods=6, threshold=1.8, min_relative_change=0.15),
             support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
             impact=ImpactModel(kind="none"),
             unit="ratio",
@@ -256,17 +241,13 @@ def build_catalog() -> dict[str, KPIDefinition]:
                     "slice of the basket mix around the €20 cliff."
                 ),
                 owner="Commercial Growth / Promotions",
-                formula=Formula(
-                    kind="ratio",
-                    numerator=_measure,
-                    denominator=Measure.ORDERS,
-                ),
+                formula=Formula.ratio(_measure, Measure.ORDERS),
                 dimensions=dims,
                 dependencies=(),
                 # Two-sided on purpose: basket mix is evidence, not a target.
                 directionality=Directionality.TWO_SIDED,
-                detector=DetectorConfig(
-                    baseline_weeks=6, z_threshold=1.8, min_relative_change=0.15
+                detector=SeasonalZScore(
+                    lookback_periods=6, threshold=1.8, min_relative_change=0.15
                 ),
                 support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
                 impact=ImpactModel(kind="none"),
@@ -286,11 +267,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Discount Cost / Order",
             description="Average promotional discount per order (€10 on redemptions).",
             owner="Commercial Growth / Promotions",
-            formula=Formula(
-                kind="ratio",
-                numerator=Measure.DISCOUNT_COST,
-                denominator=Measure.ORDERS,
-            ),
+            formula=Formula.ratio(Measure.DISCOUNT_COST, Measure.ORDERS),
             dimensions=dims,
             dependencies=(),
             directionality=Directionality.HIGHER_IS_BAD,
@@ -306,15 +283,11 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Delivery Cost / Order",
             description="Courier cost per completed order.",
             owner="Operations",
-            formula=Formula(
-                kind="ratio",
-                numerator=Measure.DELIVERY_COST,
-                denominator=Measure.ORDERS,
-            ),
+            formula=Formula.ratio(Measure.DELIVERY_COST, Measure.ORDERS),
             dimensions=dims,
             dependencies=(),
             directionality=Directionality.HIGHER_IS_BAD,
-            detector=DetectorConfig(baseline_weeks=6, z_threshold=3.0, min_relative_change=0.12),
+            detector=SeasonalZScore(lookback_periods=6, threshold=3.0, min_relative_change=0.12),
             support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
             impact=ImpactModel(kind="cost_delta"),
             unit="eur",
@@ -327,15 +300,11 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Avg Time to Delivery",
             description="Average minutes from order placed to customer delivery.",
             owner="Operations",
-            formula=Formula(
-                kind="ratio",
-                numerator=Measure.DELIVERY_MINUTES,
-                denominator=Measure.ORDERS,
-            ),
+            formula=Formula.ratio(Measure.DELIVERY_MINUTES, Measure.ORDERS),
             dimensions=dims,
             dependencies=("late_delivery_rate",),
             directionality=Directionality.HIGHER_IS_BAD,
-            detector=DetectorConfig(baseline_weeks=6, z_threshold=2.0, min_relative_change=0.08),
+            detector=SeasonalZScore(lookback_periods=6, threshold=2.0, min_relative_change=0.08),
             support=SupportRequirement(measure=Measure.ORDERS, minimum=30),
             impact=ImpactModel(kind="none"),
             unit="count",
@@ -348,15 +317,11 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Late Delivery Rate",
             description="Share of orders delivered after the promised ETA window.",
             owner="Operations",
-            formula=Formula(
-                kind="ratio",
-                numerator=Measure.LATE_ORDERS,
-                denominator=Measure.ORDERS,
-            ),
+            formula=Formula.ratio(Measure.LATE_ORDERS, Measure.ORDERS),
             dimensions=dims,
             dependencies=(),
             directionality=Directionality.HIGHER_IS_BAD,
-            detector=DetectorConfig(baseline_weeks=6, z_threshold=2.0, min_relative_change=0.10),
+            detector=SeasonalZScore(lookback_periods=6, threshold=2.0, min_relative_change=0.10),
             support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
             impact=ImpactModel(kind="none"),
             unit="ratio",
@@ -370,15 +335,11 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Restaurant Payout / Order",
             description="Average restaurant payout per order.",
             owner="Marketplace",
-            formula=Formula(
-                kind="ratio",
-                numerator=Measure.RESTAURANT_PAYOUT,
-                denominator=Measure.ORDERS,
-            ),
+            formula=Formula.ratio(Measure.RESTAURANT_PAYOUT, Measure.ORDERS),
             dimensions=dims,
             dependencies=(),
             directionality=Directionality.TWO_SIDED,
-            detector=DetectorConfig(baseline_weeks=6, z_threshold=3.0, min_relative_change=0.12),
+            detector=SeasonalZScore(lookback_periods=6, threshold=3.0, min_relative_change=0.12),
             support=SupportRequirement(measure=Measure.ORDERS, minimum=25),
             impact=ImpactModel(kind="cost_delta"),
             unit="eur",
@@ -393,11 +354,11 @@ def build_catalog() -> dict[str, KPIDefinition]:
                 "B2B pipeline. orthogonal to lunch promo economics."
             ),
             owner="Marketplace",
-            formula=Formula(kind="sum", measure=Measure.RESTAURANT_LEADS),
+            formula=Formula.sum(Measure.RESTAURANT_LEADS),
             dimensions=("city", "meal_period", "channel"),
             dependencies=(),
             directionality=Directionality.TWO_SIDED,
-            detector=DetectorConfig(baseline_weeks=6, z_threshold=3.5, min_relative_change=0.25),
+            detector=SeasonalZScore(lookback_periods=6, threshold=3.5, min_relative_change=0.25),
             support=SupportRequirement(measure=Measure.RESTAURANT_LEADS, minimum=5),
             impact=ImpactModel(kind="none"),
             unit="count",
@@ -409,11 +370,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Conversion Rate",
             description="Orders divided by sessions.",
             owner="Growth",
-            formula=Formula(
-                kind="ratio",
-                numerator=Measure.ORDERS,
-                denominator=Measure.SESSIONS,
-            ),
+            formula=Formula.ratio(Measure.ORDERS, Measure.SESSIONS),
             dimensions=dims,
             dependencies=("orders",),
             directionality=Directionality.TWO_SIDED,
@@ -429,11 +386,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             label="Promo Redemption Rate",
             description="Share of orders that redeemed a promotion.",
             owner="Commercial Growth / Promotions",
-            formula=Formula(
-                kind="ratio",
-                numerator=Measure.PROMO_ORDERS,
-                denominator=Measure.ORDERS,
-            ),
+            formula=Formula.ratio(Measure.PROMO_ORDERS, Measure.ORDERS),
             dimensions=dims,
             dependencies=(),
             directionality=Directionality.HIGHER_IS_BAD,

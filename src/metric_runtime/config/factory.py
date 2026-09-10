@@ -87,7 +87,13 @@ def build_executor_from_connection(
 ):
     from metric_runtime.execution.duckdb import DuckDBExecutor
 
-    fact_table = conn.fact_table or project.runtime.fact_table or "pypizza_halfhourly"
+    fact_table = conn.fact_table or project.runtime.fact_table
+    if not fact_table:
+        raise ConfigurationError(
+            "DuckDB connection requires fact_table "
+            "(set connections.<name>.fact_table or runtime.fact_table "
+            "in metric-runtime.yaml)."
+        )
     if conn.path is None:
         raise ConfigurationError("DuckDB connection requires path")
     path = Path(conn.path)
