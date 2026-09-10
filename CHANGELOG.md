@@ -10,14 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Executable Pydantic KPI semantic model (`KPI`)
+- Generic measure references + `Formula.sum` / `Formula.ratio` / `Formula.difference`
+- Per-KPI detector instances (`SeasonalZScore`, `Threshold`) with engine-level default
 - `KPICatalog` with dependency and cycle validation
 - Pluggable detectors (`SeasonalZScoreDetector`, `ThresholdDetector`)
 - KPI state machine (NORMAL → DETECTED → OPEN → …)
 - Semantic dependency graph (NetworkX) and graph-aware investigation
 - Incident model with ownership routing helpers
 - In-memory state store and notifier extension points
-- Optional DuckDB execution backend
+- Optional DuckDB execution backend (schema-agnostic; explicit `fact_table`)
 - Project/connections configuration (`metric-runtime.yaml` + `connections.yaml`)
 - Small CLI (`validate`, `config show`, `run`, `connections test`)
-- PyPizza / Great Lunch flagship example
+- PyPizza / Great Lunch flagship example (domain measures live under `examples/pypizza/`)
 - MIT license and open-source documentation baseline
+
+### Changed
+
+- Core package no longer ships a domain `Measure` enum or PyPizza warehouse defaults
+- Support gates require an explicit `SupportRequirement` (no implicit `orders` column)

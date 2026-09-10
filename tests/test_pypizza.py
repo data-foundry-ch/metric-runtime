@@ -36,6 +36,7 @@ from demo import (  # noqa: E402
 from graph_layout import presentation_dependency_layout, radial_dependency_layout  # noqa: E402
 from impact import campaign_impact_decomposition  # noqa: E402
 from quality import check_data_quality  # noqa: E402
+from queries import basket_distribution  # noqa: E402
 
 START = datetime(2026, 5, 15, 11, 30)
 END = datetime(2026, 5, 17, 13, 30)
@@ -49,7 +50,7 @@ def engine():
     if not DB.exists():
         pytest.skip("pypizza.duckdb missing. run examples/pypizza/generate_data.py")
     con = duckdb.connect(str(DB), read_only=True)
-    yield KPIEngine(build_catalog(), connection=con)
+    yield KPIEngine(build_catalog(), connection=con, fact_table="pypizza_halfhourly")
     con.close()
 
 
@@ -104,7 +105,7 @@ def test_campaign_story_shape(engine: KPIEngine):
 
 
 def test_basket_cliff(engine: KPIEngine):
-    dist = engine.basket_distribution(START, END, {**AMS_LUNCH, "campaign": "great_lunch"})
+    dist = basket_distribution(engine, START, END, {**AMS_LUNCH, "campaign": "great_lunch"})
     by = {r["basket_band"]: r["orders"] for r in dist}
     total = sum(by.values()) or 1
     assert by.get("20-24.99", 0) / total > 0.40

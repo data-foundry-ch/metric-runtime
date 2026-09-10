@@ -37,9 +37,13 @@ class Detector(Protocol):
 
 
 class DetectorStrategy(ABC):
-    """Legacy-compatible detector base used by KPIEngine.evaluate."""
+    """Detector base used by KPIEngine.evaluate."""
 
     name: str = "detector"
+
+    def as_config(self) -> DetectorConfig:
+        """Return detector parameters used for baseline lookback, etc."""
+        return DetectorConfig()
 
     @abstractmethod
     def evaluate(
@@ -64,7 +68,7 @@ class DetectorStrategy(ABC):
         directionality: Directionality = Directionality.TWO_SIDED,
         config: DetectorConfig | None = None,
     ) -> Detection:
-        cfg = config or DetectorConfig()
+        cfg = config or self.as_config()
         baseline = [h.value for h in history] or list(observation.baseline_values)
         status = self.evaluate(
             observation.name,
@@ -102,11 +106,20 @@ class SeasonalZScoreDetector(DetectorStrategy):
 
     def __init__(
         self,
-        lookback_periods: int | None = None,
-        threshold: float | None = None,
+        lookback_periods: int = 6,
+        threshold: float = 2.5,
+        min_relative_change: float = 0.08,
     ) -> None:
         self.lookback_periods = lookback_periods
         self.threshold = threshold
+        self.min_relative_change = min_relative_change
+
+    def as_config(self) -> DetectorConfig:
+        return DetectorConfig(
+            baseline_weeks=self.lookback_periods,
+            z_threshold=self.threshold,
+            min_relative_change=self.min_relative_change,
+        )
 
     def evaluate(
         self,
@@ -120,8 +133,15 @@ class SeasonalZScoreDetector(DetectorStrategy):
         support_ok: bool,
         as_of: str,
     ) -> KPIStatus:
-        z_threshold = self.threshold if self.threshold is not None else config.z_threshold
-        effective = config.model_copy(update={"z_threshold": z_threshold})
+        # Instance parameters win over a separately supplied config.
+        effective = DetectorConfig(
+            baseline_weeks=self.lookback_periods or config.baseline_weeks,
+            z_threshold=self.threshold if self.threshold is not None else config.z_threshold,
+            min_relative_change=self.min_relative_change
+            if self.min_relative_change is not None
+            else config.min_relative_change,
+            absolute_threshold=config.absolute_threshold,
+        )
 
         baseline_mean = mean(baseline) if baseline else 0.0
         baseline_std = (pstdev(baseline) if len(baseline) > 1 else 0.0) or max(
@@ -155,7 +175,8 @@ class SeasonalZScoreDetector(DetectorStrategy):
         )
 
 
-# Back-compat alias used by older imports / talk slides.
+# Friendly / back-compat aliases.
+SeasonalZScore = SeasonalZScoreDetector
 SeasonalBaselineDetector = SeasonalZScoreDetector
 
 
@@ -163,6 +184,24 @@ class ThresholdDetector(DetectorStrategy):
     """Simple absolute / relative threshold — proves detectors are swappable."""
 
     name = "threshold"
+
+    def __init__(
+        self,
+        *,
+        absolute_threshold: float | None = None,
+        min_relative_change: float = 0.08,
+        lookback_periods: int = 6,
+    ) -> None:
+        self.absolute_threshold = absolute_threshold
+        self.min_relative_change = min_relative_change
+        self.lookback_periods = lookback_periods
+
+    def as_config(self) -> DetectorConfig:
+        return DetectorConfig(
+            baseline_weeks=self.lookback_periods,
+            min_relative_change=self.min_relative_change,
+            absolute_threshold=self.absolute_threshold,
+        )
 
     def evaluate(
         self,
@@ -176,6 +215,12 @@ class ThresholdDetector(DetectorStrategy):
         support_ok: bool,
         as_of: str,
     ) -> KPIStatus:
+        absolute = (
+            self.absolute_threshold
+            if self.absolute_threshold is not None
+            else config.absolute_threshold
+        )
+        min_rel = self.min_relative_change
         baseline_mean = mean(baseline) if baseline else 0.0
         baseline_std = (pstdev(baseline) if len(baseline) > 1 else 0.0) or max(
             abs(baseline_mean) * 0.001, 1e-9
@@ -185,17 +230,15 @@ class ThresholdDetector(DetectorStrategy):
 
         anomaly = False
         if support_ok:
-            if config.absolute_threshold is not None:
+            if absolute is not None:
                 if directionality == Directionality.LOWER_IS_BAD:
-                    anomaly = current < config.absolute_threshold
+                    anomaly = current < absolute
                 elif directionality == Directionality.HIGHER_IS_BAD:
-                    anomaly = current > config.absolute_threshold
+                    anomaly = current > absolute
                 else:
-                    anomaly = abs(current - config.absolute_threshold) > 0
+                    anomaly = abs(current - absolute) > 0
             else:
-                anomaly = abs(
-                    relative_change
-                ) >= config.min_relative_change and _directional_anomaly(
+                anomaly = abs(relative_change) >= min_rel and _directional_anomaly(
                     current, baseline_mean, directionality
                 )
 
@@ -214,3 +257,6 @@ class ThresholdDetector(DetectorStrategy):
             state=KPIState.DETECTED if anomaly else KPIState.NORMAL,
             severity=_severity(z_score, relative_change) if anomaly else 0.0,
         )
+
+
+Threshold = ThresholdDetector

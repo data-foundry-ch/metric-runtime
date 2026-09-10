@@ -56,6 +56,7 @@ def _():
     from formatters import money, metric_fmt, pct
     from impact import campaign_impact_decomposition
     from quality import check_data_quality
+    from queries import basket_distribution
     from viz import PLOTLY_DISPLAY_CONFIG, build_plotly_network
 
     open_smart_incident = open_pypizza_incident
@@ -80,6 +81,7 @@ def _():
         ThresholdDetector,
         alt,
         build_catalog,
+        basket_distribution,
         build_plotly_network,
         build_talk_graph,
         campaign_impact_decomposition,
@@ -115,7 +117,7 @@ def _(KPIEngine, Path, build_catalog, datetime, duckdb):
         )
     con = duckdb.connect(str(db_path), read_only=True)
     catalog = build_catalog()
-    engine = KPIEngine(catalog, connection=con)
+    engine = KPIEngine(catalog, connection=con, fact_table="pypizza_halfhourly")
     CAMPAIGN_START = datetime(2026, 5, 15, 11, 30)
     CAMPAIGN_END = datetime(2026, 5, 17, 13, 30)
     AMS_LUNCH = {"city": "Amsterdam", "meal_period": "lunch"}
@@ -626,23 +628,23 @@ def _(catalog, mo):
         _formula_src = (
             "Formula(\n"
             f'        kind="{_formula.kind}",\n'
-            f"        numerator=Measure.{_formula.numerator.name},\n"
-            f"        denominator=Measure.{_formula.denominator.name},\n"
+            f"        numerator={_formula.numerator!r},\n"
+            f"        denominator={_formula.denominator!r},\n"
             "    )"
         )
     elif _formula.kind == "sum":
         _formula_src = (
             "Formula(\n"
             f'        kind="{_formula.kind}",\n'
-            f"        measure=Measure.{_formula.measure.name},\n"
+            f"        measure={_formula.measure!r},\n"
             "    )"
         )
     else:
         _formula_src = (
             "Formula(\n"
             f'        kind="{_formula.kind}",\n'
-            f"        left=Measure.{_formula.left.name},\n"
-            f"        right=Measure.{_formula.right.name},\n"
+            f"        left={_formula.left!r},\n"
+            f"        right={_formula.right!r},\n"
             "    )"
         )
     _support = _pm.support
@@ -651,7 +653,7 @@ def _(catalog, mo):
         if _support is None
         else (
             "SupportRequirement(\n"
-            f"        measure=Measure.{_support.measure.name},\n"
+            f"        measure={_support.measure!r},\n"
             f"        minimum={_support.minimum},\n"
             "    )"
         )
@@ -1172,8 +1174,9 @@ def _(
 
     pre_start = datetime(2026, 5, 8, 11, 30)
     pre_end = datetime(2026, 5, 10, 13, 30)
-    before = engine.basket_distribution(pre_start, pre_end, AMS_LUNCH)
-    during = engine.basket_distribution(
+    before = basket_distribution(engine, pre_start, pre_end, AMS_LUNCH)
+    during = basket_distribution(
+        engine,
         CAMPAIGN_START,
         CAMPAIGN_END,
         {**AMS_LUNCH, "campaign": "great_lunch"},

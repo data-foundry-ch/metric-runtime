@@ -16,21 +16,26 @@ Metrics aren't just numbers.
 A metric without context isn't intelligence. It's arithmetic.
 
 ```python
-from metric_runtime import KPI, KPICatalog, KPIEngine, InMemoryStateStore
-from metric_runtime.models import DetectorConfig, Directionality
+from metric_runtime import (
+    Formula,
+    InMemoryStateStore,
+    KPI,
+    KPICatalog,
+    KPIEngine,
+    SeasonalZScore,
+)
+from metric_runtime.models import Directionality
 
 profit_margin = KPI(
     name="profit_margin",
     owner="commercial-finance",
+    formula=Formula.ratio("profit", "revenue"),
     dependencies=[
         "average_order_value",
         "average_cost_per_order",
     ],
     directionality=Directionality.LOWER_IS_BAD,
-    detector=DetectorConfig(
-        baseline_weeks=6,
-        z_threshold=3.0,
-    ),
+    detector=SeasonalZScore(lookback_periods=6, threshold=3.0),
 )
 
 catalog = KPICatalog([profit_margin])  # include dependency KPIs in real use
@@ -91,23 +96,44 @@ pip install -e ".[duckdb,dev]"
 ```
 
 ```python
-from metric_runtime import KPI, KPICatalog, KPIEngine, InMemoryStateStore
+from metric_runtime import Formula, InMemoryStateStore, KPI, KPICatalog, KPIEngine, SeasonalZScore
 from metric_runtime.execution import DuckDBExecutor
-from metric_runtime.models import DetectorConfig, Directionality, Formula, Measure
+from metric_runtime.models import Directionality
 
 catalog = KPICatalog([
     KPI(
-        name="orders",
+        name="requests",
         owner="growth",
-        formula=Formula(kind="sum", measure=Measure.ORDERS),
+        formula=Formula.sum("requests"),
         directionality=Directionality.TWO_SIDED,
-        detector=DetectorConfig(),
+    ),
+    KPI(
+        name="customers",
+        owner="growth",
+        formula=Formula.sum("customers"),
+        dependencies=("requests",),
+    ),
+    KPI(
+        name="conversion_rate",
+        owner="growth",
+        formula=Formula.ratio("customers", "requests"),
+        dependencies=("customers", "requests"),
+        directionality=Directionality.LOWER_IS_BAD,
+        detector=SeasonalZScore(lookback_periods=6, threshold=3.0),
+    ),
+    KPI(
+        name="recurring_revenue",
+        owner="finance",
+        formula=Formula.sum("recurring_revenue"),
+        dependencies=("customers",),
+        directionality=Directionality.LOWER_IS_BAD,
+        detector=SeasonalZScore(lookback_periods=6, threshold=2.5),
     ),
 ])
 
 engine = KPIEngine(
     catalog=catalog,
-    executor=DuckDBExecutor("metrics.duckdb"),
+    executor=DuckDBExecutor("metrics.duckdb", fact_table="daily_metrics"),
     state_store=InMemoryStateStore(),
 )
 ```

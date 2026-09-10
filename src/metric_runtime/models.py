@@ -2,44 +2,38 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+_MEASURE_REF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-class Measure(str, Enum):
-    """Named atomic measures used by formula definitions.
+def coerce_measure_ref(value: Any) -> str:
+    """Normalize enums / strings into a generic measure identifier."""
+    if isinstance(value, Enum):
+        value = value.value
+    if not isinstance(value, str):
+        raise TypeError(f"Measure reference must be a string, got {type(value)!r}")
+    name = value.strip()
+    if not _MEASURE_REF_RE.match(name):
+        raise ValueError(
+            f"Invalid measure reference {name!r}. "
+            "Expected an identifier like 'orders' or 'gross_revenue'."
+        )
+    return name
 
-    Measure names are semantic identifiers. How they map to columns or
-    expressions is an executor concern.
-    """
 
-    SESSIONS = "sessions"
-    ORDERS = "orders"
-    PROMO_ORDERS = "promo_orders"
-    THRESHOLD_BAND_ORDERS = "threshold_band_orders"
-    BAND_UNDER_20_ORDERS = "band_under_20_orders"
-    BAND_25_29_ORDERS = "band_25_29_orders"
-    BAND_30_39_ORDERS = "band_30_39_orders"
-    BAND_40_PLUS_ORDERS = "band_40_plus_orders"
-    NEW_CUSTOMER_ORDERS = "new_customer_orders"
-    LEADS = "leads"
-    OPPORTUNITIES = "opportunities"
-    RESTAURANT_LEADS = "restaurant_leads"
-    GROSS_ORDER_VALUE = "gross_order_value_eur"
-    DISCOUNT_COST = "discount_cost_eur"
-    DELIVERY_FEE_REVENUE = "delivery_fee_revenue_eur"
-    RESTAURANT_PAYOUT = "restaurant_payout_eur"
-    DELIVERY_COST = "delivery_cost_eur"
-    PAYMENT_PROCESSING_COST = "payment_processing_cost_eur"
-    REFUNDS = "refunds_eur"
-    NET_REVENUE = "net_revenue_eur"
-    VARIABLE_COST = "variable_cost_eur"
-    PLATFORM_COST = "platform_cost_eur"
-    WEEKEND_PROFIT = "weekend_profit_eur"
-    DELIVERY_MINUTES = "delivery_minutes"
-    LATE_ORDERS = "late_orders"
+# Public alias: validated measure identifier (not a framework-owned domain enum).
+MeasureRef = str
 
 
 class Directionality(str, Enum):
@@ -67,12 +61,21 @@ MetricState = KPIState
 
 
 class Formula(BaseModel):
+    """How a KPI is calculated from generic measure references."""
+
     kind: Literal["sum", "ratio", "difference"]
-    measure: Measure | None = None
-    numerator: Measure | None = None
-    denominator: Measure | None = None
-    left: Measure | None = None
-    right: Measure | None = None
+    measure: MeasureRef | None = None
+    numerator: MeasureRef | None = None
+    denominator: MeasureRef | None = None
+    left: MeasureRef | None = None
+    right: MeasureRef | None = None
+
+    @field_validator("measure", "numerator", "denominator", "left", "right", mode="before")
+    @classmethod
+    def _coerce_refs(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        return coerce_measure_ref(value)
 
     @model_validator(mode="after")
     def validate_shape(self) -> Formula:
@@ -84,11 +87,32 @@ class Formula(BaseModel):
             raise ValueError("difference formulas require left and right")
         return self
 
+    @classmethod
+    def sum(cls, measure: str | Enum) -> Formula:
+        return cls(kind="sum", measure=coerce_measure_ref(measure))
+
+    @classmethod
+    def ratio(cls, numerator: str | Enum, denominator: str | Enum) -> Formula:
+        return cls(
+            kind="ratio",
+            numerator=coerce_measure_ref(numerator),
+            denominator=coerce_measure_ref(denominator),
+        )
+
+    @classmethod
+    def difference(cls, left: str | Enum, right: str | Enum) -> Formula:
+        return cls(
+            kind="difference",
+            left=coerce_measure_ref(left),
+            right=coerce_measure_ref(right),
+        )
+
 
 class DetectorConfig(BaseModel):
     """Parameters consumed by detector implementations.
 
     The z-score is one detector implementation, not the architecture.
+    Prefer attaching a detector instance on the KPI when possible.
     """
 
     baseline_weeks: int = Field(default=6, ge=3, le=12)
@@ -98,8 +122,13 @@ class DetectorConfig(BaseModel):
 
 
 class SupportRequirement(BaseModel):
-    measure: Measure
+    measure: MeasureRef
     minimum: float = Field(default=30.0, ge=0)
+
+    @field_validator("measure", mode="before")
+    @classmethod
+    def _coerce_measure(cls, value: Any) -> str:
+        return coerce_measure_ref(value)
 
 
 class ImpactModel(BaseModel):
@@ -119,6 +148,8 @@ class KPI(BaseModel):
     is evaluated.
     """
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     name: str
     label: str | None = None
     description: str = ""
@@ -127,7 +158,8 @@ class KPI(BaseModel):
     dimensions: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
     directionality: Directionality = Directionality.TWO_SIDED
-    detector: DetectorConfig = Field(default_factory=DetectorConfig)
+    # DetectorStrategy instance, DetectorConfig, or None (engine default).
+    detector: Any = Field(default_factory=DetectorConfig)
     support: SupportRequirement | None = None
     impact: ImpactModel = Field(default_factory=ImpactModel)
     unit: Literal["count", "ratio", "eur", "percent", "unit"] = "unit"
@@ -263,7 +295,6 @@ class InvestigationResult(BaseModel):
     primary_explanatory: ExplanatoryCandidate | None = None
     impact_eur: float = 0.0
 
-    # Back-compat field names used by the PyPizza demo.
     @property
     def start_metric(self) -> str:
         return self.metric
@@ -323,7 +354,6 @@ class Incident(BaseModel):
     persistence_windows: int = 1
     suppressed_ancestors: list[str] = Field(default_factory=list)
 
-    # Back-compat aliases used by existing demo code.
     @property
     def kpi(self) -> str:
         return self.primary_metric
