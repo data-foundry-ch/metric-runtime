@@ -1,0 +1,13 @@
+# Safe local DuckDB profile for the PyPizza demo (no credentials).
+connections:
+  pypizza:
+    type: duckdb
+    path: ./data/pypizza.duckdb
+    fact_table: pypizza_halfhourly
+    read_only: true
+
+profiles:
+  local:
+    metric_source: pypizza
+    state_store:
+      type: memory

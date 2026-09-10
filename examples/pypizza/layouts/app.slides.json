@@ -1,0 +1,116 @@
+{
+  "type": "slides",
+  "data": {
+    "cells": [
+      {
+        "type": "skip"
+      },
+      {
+        "type": "skip"
+      },
+      {
+        "type": "skip"
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Title. Your Dashboard Is Too Late: The Great Lunch Incident."
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Monday 18 May. Coffee machine Marketing vs Finance email. Both right about the same weekend."
+      },
+      {
+        "type": "skip"
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Marketing dashboard: all green."
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Culprit 1: Finance dashboard: profit and margin down. No campaign context."
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Beat. Ask the room: What is a metric?"
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Culprit 2a: Traditional KPI: profit_margin = profit / revenue."
+      },
+      {
+        "type": "skip"
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Culprit 2b: The whole Pydantic object, live."
+      },
+      {
+        "type": "skip"
+      },
+      {
+        "type": "skip"
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "WHEN to alert. Live: swap the detector and watch KPIs recolour."
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "WHAT to alert on. Walk dependencies until anomalies stop."
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Network graph. Path lands on Baskets EUR20-24.99."
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Business resolution. Page Promotions about the basket mix, not Finance about profit."
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "HOW OFTEN to alert. StatePolicy + evolve_state."
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Alerts timeline. Naive flood vs one smart page to Promotions Friday 13:00."
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Architecture. Warehouse to semantics (Pydantic KPIDefinition) to graph to detector to state to one incident."
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Close + counterfactual. Promotions paged Friday; coffee machine Monday."
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Don't make the LLM understand your business. Make your business understandable to people, software, and whatever we build next."
+      },
+      {
+        "type": "slide",
+        "showCode": false,
+        "speakerNotes": "Final beat. Your dashboard isn't bad. It's just too late."
+      }
+    ],
+    "deck": {
+      "transition": "fade"
+    }
+  }
+}

@@ -1,0 +1,68 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+connections.yaml
+!connections.example.yaml
+!config/connections.example.yaml
+!examples/pypizza/connections.yaml
+
+# Generated analytical databases / demo artifacts
+*.duckdb
+*.duckdb.wal
+data/*.duckdb
+examples/pypizza/data/*.duckdb
+examples/pypizza/data/*.html
+
+# Marimo / notebooks
+**/__marimo__/
+.ipynb_checkpoints/
+
+# Presentation / conference talk material (not part of the OSS library)
+apps/
+notebooks/
+scripts/
+data/
+run_slides.sh
+speaker_script.md
+speaker_script_great_lunch.md
+talk_demo_notes.md
+# Employer/brand marks used only on slides
+**/datafoundry-logo.png
+examples/pypizza/assets/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local scratch
+*.log
+tmp/
+temp/

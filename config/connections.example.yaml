@@ -1,0 +1,41 @@
+# Example connections file — copy to connections.yaml and adapt.
+#
+# Semantics live with the project (metric-runtime.yaml).
+# Connections live with the environment (this file).
+#
+# DO NOT commit real credentials. Prefer environment-variable placeholders.
+
+connections:
+  local_analytics:
+    type: duckdb
+    path: ./examples/pypizza/data/pypizza.duckdb
+    fact_table: pypizza_halfhourly
+    read_only: true
+
+  # --- Future adapters (NOT implemented in v0.1) ---
+  # production_warehouse:
+  #   type: snowflake
+  #   account: ${SNOWFLAKE_ACCOUNT}
+  #   database: ANALYTICS
+  #   schema: MARTS
+  #   warehouse: MONITORING_WH
+  #   user: ${SNOWFLAKE_USER}
+  #   password: ${SNOWFLAKE_PASSWORD}
+  #
+  # operational_state:
+  #   type: postgres
+  #   host: ${STATE_DB_HOST}
+  #   port: 5432
+  #   database: metric_runtime
+  #   user: ${STATE_DB_USER}
+  #   password: ${STATE_DB_PASSWORD}
+
+profiles:
+  local:
+    metric_source: local_analytics
+    state_store:
+      type: memory
+
+  # production:
+  #   metric_source: production_warehouse
+  #   state_store: operational_state

@@ -1,0 +1,24 @@
+name: Feature request
+description: Propose a change to metric-runtime
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: What are you trying to accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: desired
+    attributes:
+      label: Desired behavior
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Why core vs adapter/example?
+      description: Should this live in core metric-runtime, an optional adapter, or an example?
+    validations:
+      required: true

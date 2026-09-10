@@ -1,0 +1,21 @@
+project:
+  name: pypizza
+  description: PyPizza Great Lunch flagship example
+
+catalog:
+  module: examples.pypizza.catalog
+
+runtime:
+  evaluation_interval: 30m
+  default_profile: local
+  fact_table: pypizza_halfhourly
+
+investigation:
+  max_depth: 5
+  min_support: 40
+
+state:
+  detections_before_open: 2
+  resolve_after_healthy_windows: 2
+  cooldown: 30m
+  min_impact_eur: 40

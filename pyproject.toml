@@ -1,0 +1,107 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metric-runtime"
+version = "0.1.0"
+description = "Executable semantics for business metrics — define KPIs with dependencies, detection, state, ownership, and graph-aware investigation."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "metric-runtime contributors" },
+]
+keywords = [
+  "metrics",
+  "kpi",
+  "semantics",
+  "anomaly-detection",
+  "investigation",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries",
+  "Typing :: Typed",
+]
+dependencies = [
+  "pydantic>=2.7,<3",
+  "networkx>=3.2,<4",
+  "pyyaml>=6.0,<7",
+]
+
+[project.optional-dependencies]
+duckdb = [
+  "duckdb>=1.4,<2",
+  "pandas>=2.2,<4",
+  "numpy>=1.26,<3",
+]
+demo = [
+  "metric-runtime[duckdb]",
+  "plotly>=5.22,<7",
+  "marimo>=0.13,<1",
+  "altair>=5.3,<6",
+]
+dev = [
+  "pytest>=8,<10",
+  "ruff>=0.6,<1",
+  "mypy>=1.11,<2",
+  "types-PyYAML>=6.0",
+]
+yaml = [
+  "pyyaml>=6.0,<7",
+]
+all = [
+  "metric-runtime[demo,dev]",
+]
+
+[project.scripts]
+metric-runtime = "metric_runtime.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/data-foundry-ch/metric-runtime"
+Repository = "https://github.com/data-foundry-ch/metric-runtime"
+Issues = "https://github.com/data-foundry-ch/metric-runtime/issues"
+"Bug Tracker" = "https://github.com/data-foundry-ch/metric-runtime/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+metric_runtime = ["py.typed"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "examples"]
+extend-exclude = [
+  "examples/pypizza/app.py",
+  "notebooks",
+  "apps",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501", "UP042"]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/pypizza/**" = ["B007", "B905", "F841"]
+"tests/**" = ["E402"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["metric_runtime"]
+warn_return_any = false
+warn_unused_ignores = true
+ignore_missing_imports = true
+follow_imports = "silent"
