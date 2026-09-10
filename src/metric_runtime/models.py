@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
@@ -13,6 +14,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from metric_runtime.identity import EvaluationKey, parse_datetime
 
 _MEASURE_REF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -133,13 +136,27 @@ class SupportRequirement(BaseModel):
 
 
 class ImpactModel(BaseModel):
+    """How estimated impact is derived from value vs baseline.
+
+    ``quantity_delta`` multiplies a lost/gained quantity by another metric's
+    unit value (``unit_value_metric``). Core does not hardcode domain metrics.
+    """
+
     kind: Literal[
         "none",
         "margin_delta",
         "revenue_delta",
-        "orders_delta",
         "cost_delta",
+        "quantity_delta",
     ] = "none"
+    unit_value_metric: str | None = None
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _alias_orders_delta(cls, value: Any) -> Any:
+        if value == "orders_delta":
+            return "quantity_delta"
+        return value
 
 
 def _default_detector_spec() -> Any:
@@ -210,9 +227,14 @@ class KPIObservation(BaseModel):
     value: float
     support: float = 0.0
     support_ok: bool = True
-    as_of: str
+    as_of: datetime
     filters: dict[str, str] = Field(default_factory=dict)
     baseline_values: list[float] = Field(default_factory=list)
+
+    @field_validator("as_of", mode="before")
+    @classmethod
+    def _coerce_as_of(cls, value: Any) -> datetime:
+        return parse_datetime(value)
 
 
 class Detection(BaseModel):
@@ -245,11 +267,16 @@ class KPIStatus(BaseModel):
     anomaly: bool
     support: float
     support_ok: bool
-    as_of: str
+    as_of: datetime
     directionality: Directionality = Directionality.TWO_SIDED
     root_candidate: bool = False
     state: KPIState = KPIState.NORMAL
     severity: float = 0.0
+
+    @field_validator("as_of", mode="before")
+    @classmethod
+    def _coerce_as_of(cls, value: Any) -> datetime:
+        return parse_datetime(value)
 
     def to_observation(self, filters: dict[str, str] | None = None) -> KPIObservation:
         return KPIObservation(
@@ -272,6 +299,40 @@ class KPIStatus(BaseModel):
             severity=self.severity,
             state=self.state,
         )
+
+
+class StoredObservation(BaseModel):
+    """Persisted observation for one EvaluationKey."""
+
+    key: EvaluationKey
+    status: KPIStatus
+    eligible_for_state: bool = True
+    quality_healthy: bool | None = None
+    recorded_at: datetime
+
+    @field_validator("recorded_at", mode="before")
+    @classmethod
+    def _coerce_recorded_at(cls, value: Any) -> datetime:
+        return parse_datetime(value)
+
+
+class MetricStateRecord(BaseModel):
+    """Operational state for one metric + scope."""
+
+    metric: str
+    scope_key: str = ""
+    scope: dict[str, str] = Field(default_factory=dict)
+    state: KPIState = KPIState.NORMAL
+    state_since: datetime
+    updated_at: datetime
+    resolved_at: datetime | None = None
+
+    @field_validator("state_since", "updated_at", "resolved_at", mode="before")
+    @classmethod
+    def _coerce_dt(cls, value: Any) -> Any:
+        if value is None or value == "":
+            return None
+        return parse_datetime(value)
 
 
 class DrilldownRow(BaseModel):
@@ -358,9 +419,9 @@ class Incident(BaseModel):
     scope: dict[str, str] = Field(default_factory=dict)
     owner: str
     state: IncidentState
-    opened_at: str | None = None
-    updated_at: str | None = None
-    first_detected: str
+    opened_at: datetime | None = None
+    updated_at: datetime | None = None
+    first_detected: datetime
     estimated_impact: float = 0.0
     evidence: list[str] = Field(default_factory=list)
     related_metrics: list[str] = Field(default_factory=list)
@@ -368,6 +429,13 @@ class Incident(BaseModel):
     context: list[str] = Field(default_factory=list)
     persistence_windows: int = 1
     suppressed_ancestors: list[str] = Field(default_factory=list)
+
+    @field_validator("opened_at", "updated_at", "first_detected", mode="before")
+    @classmethod
+    def _coerce_dt(cls, value: Any) -> Any:
+        if value is None or value == "":
+            return None
+        return parse_datetime(value)
 
     @property
     def kpi(self) -> str:
@@ -378,15 +446,33 @@ class Incident(BaseModel):
         return self.estimated_impact
 
 
-class NotificationEvent(BaseModel):
-    """Record of a notification emitted by ``KPIEngine.process``."""
+class OutboxEvent(BaseModel):
+    """Durable notification intent — persist before delivery."""
 
+    id: str | None = None
     kind: Literal["incident_opened", "incident_updated", "incident_resolved", "state_changed"]
-    incident: Incident | None = None
     metric: str = ""
+    incident: Incident | None = None
     previous_state: KPIState | None = None
     current_state: KPIState | None = None
     message: str = ""
+    created_at: datetime
+    delivered_at: datetime | None = None
+
+    @field_validator("created_at", "delivered_at", mode="before")
+    @classmethod
+    def _coerce_dt(cls, value: Any) -> Any:
+        if value is None or value == "":
+            return None
+        return parse_datetime(value)
+
+    @property
+    def pending(self) -> bool:
+        return self.delivered_at is None
+
+
+# Back-compat alias used by ProcessResult / older call sites.
+NotificationEvent = OutboxEvent
 
 
 class ProcessResult(BaseModel):
@@ -394,13 +480,19 @@ class ProcessResult(BaseModel):
 
     metric: str
     scope: dict[str, str] = Field(default_factory=dict)
-    at: str
+    evaluation_key: EvaluationKey | None = None
+    at: datetime
     status: KPIStatus
     transition: Any  # KPIStateTransition NamedTuple (previous, current)
     new_incidents: list[Incident] = Field(default_factory=list)
     updated_incidents: list[Incident] = Field(default_factory=list)
-    notifications: list[NotificationEvent] = Field(default_factory=list)
+    notifications: list[OutboxEvent] = Field(default_factory=list)
     investigation: InvestigationResult | None = None
     idempotent: bool = False
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @field_validator("at", mode="before")
+    @classmethod
+    def _coerce_at(cls, value: Any) -> datetime:
+        return parse_datetime(value)

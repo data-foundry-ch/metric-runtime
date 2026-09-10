@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import networkx as nx
 
 from metric_runtime import KPI, KPICatalog
@@ -20,7 +22,7 @@ def _status(name: str, *, anomaly: bool, directionality: Directionality) -> KPIS
         anomaly=anomaly,
         support=100,
         support_ok=True,
-        as_of="t",
+        as_of=datetime(2026, 1, 1, tzinfo=UTC),
         directionality=directionality,
         state=KPIState.DETECTED if anomaly else KPIState.NORMAL,
         severity=5.0 if anomaly else 0.0,

@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from datetime import datetime
 from statistics import mean, pstdev
 from typing import Protocol, runtime_checkable
 
+from metric_runtime.identity import parse_datetime
 from metric_runtime.models import (
     Detection,
     DetectorConfig,
@@ -56,7 +58,7 @@ class DetectorStrategy(ABC):
         config: DetectorConfig,
         support: float,
         support_ok: bool,
-        as_of: str,
+        as_of: datetime | str,
     ) -> KPIStatus:
         raise NotImplementedError
 
@@ -131,7 +133,7 @@ class SeasonalZScoreDetector(DetectorStrategy):
         config: DetectorConfig,
         support: float,
         support_ok: bool,
-        as_of: str,
+        as_of: datetime | str,
     ) -> KPIStatus:
         # Instance parameters win over a separately supplied config.
         effective = DetectorConfig(
@@ -168,7 +170,7 @@ class SeasonalZScoreDetector(DetectorStrategy):
             anomaly=anomaly,
             support=support,
             support_ok=support_ok,
-            as_of=as_of,
+            as_of=parse_datetime(as_of),
             directionality=directionality,
             state=KPIState.DETECTED if anomaly else KPIState.NORMAL,
             severity=_severity(z_score, relative_change) if anomaly else 0.0,
@@ -212,7 +214,7 @@ class ThresholdDetector(DetectorStrategy):
         config: DetectorConfig,
         support: float,
         support_ok: bool,
-        as_of: str,
+        as_of: datetime | str,
     ) -> KPIStatus:
         absolute = (
             self.absolute_threshold
@@ -251,7 +253,7 @@ class ThresholdDetector(DetectorStrategy):
             anomaly=anomaly,
             support=support,
             support_ok=support_ok,
-            as_of=as_of,
+            as_of=parse_datetime(as_of),
             directionality=directionality,
             state=KPIState.DETECTED if anomaly else KPIState.NORMAL,
             severity=_severity(z_score, relative_change) if anomaly else 0.0,

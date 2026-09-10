@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from metric_runtime import (
     KPI,
@@ -20,6 +20,10 @@ from metric_runtime.models import (
     QualityReport,
 )
 from metric_runtime.notifications import RecordingNotifier
+
+
+def _ts(*args: int) -> datetime:
+    return datetime(*args, tzinfo=UTC)
 
 
 def _status(
@@ -40,7 +44,7 @@ def _status(
         anomaly=anomaly,
         support=100,
         support_ok=True,
-        as_of=at.isoformat(sep=" "),
+        as_of=at,
         directionality=Directionality.LOWER_IS_BAD,
         state=KPIState.DETECTED if anomaly else KPIState.NORMAL,
         severity=8.0 if anomaly else 0.0,
@@ -78,11 +82,13 @@ def _engine() -> tuple[KPIEngine, RecordingNotifier]:
 
 def test_process_detected_then_open_then_idempotent(monkeypatch):
     engine, notifier = _engine()
-    t1 = datetime(2026, 5, 15, 12, 0)
-    t2 = datetime(2026, 5, 15, 12, 30)
+    t1 = _ts(2026, 5, 15, 12, 0)
+    t2 = _ts(2026, 5, 15, 12, 30)
     scope = {"city": "Amsterdam"}
+    calls = {"evaluate": 0}
 
     def fake_evaluate(name, at, filters=None):
+        calls["evaluate"] += 1
         return _status(name, at, anomaly=True)
 
     def fake_investigate(metric, at=None, **kwargs):
@@ -120,12 +126,23 @@ def test_process_detected_then_open_then_idempotent(monkeypatch):
     assert second.transition == (KPIState.DETECTED, KPIState.OPEN)
     assert len(second.new_incidents) == 1
     assert second.new_incidents[0].owner == "commercial-growth"
+    assert len(second.notifications) == 1
+    assert second.notifications[0].pending is True
+    assert notifier.incidents == []
+
+    delivered = engine.deliver_notifications()
+    assert len(delivered) == 1
+    assert delivered[0].pending is False
     assert len(notifier.incidents) == 1
 
+    evaluate_before_retry = calls["evaluate"]
+    stored_value = second.status.value
     retry = engine.process(metric="profit_margin", at=t2, scope=scope)
     assert retry.idempotent is True
     assert retry.new_incidents == []
     assert retry.notifications == []
+    assert retry.status.value == stored_value
+    assert calls["evaluate"] == evaluate_before_retry
     assert len(notifier.incidents) == 1
 
 
@@ -133,10 +150,10 @@ def test_process_resolves_after_healthy_windows(monkeypatch):
     engine, notifier = _engine()
     scope = {"city": "Amsterdam"}
     stamps = [
-        datetime(2026, 5, 15, 12, 0),
-        datetime(2026, 5, 15, 12, 30),
-        datetime(2026, 5, 15, 13, 0),
-        datetime(2026, 5, 15, 13, 30),
+        _ts(2026, 5, 15, 12, 0),
+        _ts(2026, 5, 15, 12, 30),
+        _ts(2026, 5, 15, 13, 0),
+        _ts(2026, 5, 15, 13, 30),
     ]
 
     def fake_evaluate(name, at, filters=None):
@@ -172,6 +189,7 @@ def test_process_resolves_after_healthy_windows(monkeypatch):
     opened = engine.process(metric="profit_margin", at=stamps[1], scope=scope)
     assert opened.transition == (KPIState.DETECTED, KPIState.OPEN)
     assert len(opened.new_incidents) == 1
+    engine.deliver_notifications()
 
     mid = engine.process(metric="profit_margin", at=stamps[2], scope=scope)
     assert mid.transition == (KPIState.OPEN, KPIState.OPEN)
@@ -182,9 +200,10 @@ def test_process_resolves_after_healthy_windows(monkeypatch):
     assert any(n.kind == "incident_resolved" for n in resolved.notifications)
 
 
-def test_process_quality_suppresses(monkeypatch):
+def test_process_quality_suppresses_without_poisoning_history(monkeypatch):
     engine, _notifier = _engine()
-    at = datetime(2026, 5, 15, 12, 0)
+    t_bad = _ts(2026, 5, 15, 12, 0)
+    t_good = _ts(2026, 5, 15, 12, 30)
     monkeypatch.setattr(
         engine,
         "evaluate",
@@ -201,15 +220,67 @@ def test_process_quality_suppresses(monkeypatch):
         latest_ts="",
         message="stale",
     )
-    result = engine.process(metric="profit_margin", at=at, scope={"city": "Amsterdam"}, quality=bad)
-    assert result.transition == (KPIState.NORMAL, KPIState.SUPPRESSED)
-    assert result.new_incidents == []
+    suppressed = engine.process(
+        metric="profit_margin", at=t_bad, scope={"city": "Amsterdam"}, quality=bad
+    )
+    assert suppressed.transition == (KPIState.NORMAL, KPIState.SUPPRESSED)
+
+    next_tick = engine.process(metric="profit_margin", at=t_good, scope={"city": "Amsterdam"})
+    # Unhealthy observation must not count toward persistence streak.
+    assert next_tick.transition == (KPIState.SUPPRESSED, KPIState.DETECTED)
+
+
+def test_owner_change_while_open_enqueues_update(monkeypatch):
+    engine, notifier = _engine()
+    t1 = _ts(2026, 5, 15, 12, 0)
+    t2 = _ts(2026, 5, 15, 12, 30)
+    t3 = _ts(2026, 5, 15, 13, 0)
+    scope = {"city": "Amsterdam"}
+    owners = iter(["commercial-growth", "platform-ops"])
+
+    def fake_evaluate(name, at, filters=None):
+        return _status(name, at, anomaly=True)
+
+    def fake_investigate(metric, at=None, **kwargs):
+        owner = next(owners)
+        status = _status("basket_cliff", at or t2, anomaly=True)
+        primary = ExplanatoryCandidate(
+            name="basket_cliff",
+            owner=owner,
+            depth=1,
+            status=status,
+            impact_eur=120.0,
+            score=50.0,
+        )
+        return InvestigationResult(
+            metric=metric,
+            anomalous_metrics=[status],
+            normal_dependencies=[],
+            root_candidates=[status],
+            explanatory_paths=[[metric, "basket_cliff"]],
+            deepest_candidates=[primary],
+            primary_explanatory=primary,
+            impact_eur=120.0,
+        )
+
+    monkeypatch.setattr(engine, "evaluate", fake_evaluate)
+    monkeypatch.setattr(engine, "estimate_impact_eur", lambda *a, **k: 120.0)
+    monkeypatch.setattr(engine, "investigate", fake_investigate)
+
+    engine.process(metric="profit_margin", at=t1, scope=scope)
+    opened = engine.process(metric="profit_margin", at=t2, scope=scope)
+    assert opened.transition.current == KPIState.OPEN
+    updated = engine.process(metric="profit_margin", at=t3, scope=scope)
+    assert updated.transition == (KPIState.OPEN, KPIState.OPEN)
+    assert any(n.kind == "incident_updated" for n in updated.notifications)
+    engine.deliver_notifications()
+    assert len(notifier.incidents) == 2
 
 
 def test_acknowledge_is_sticky(monkeypatch):
     engine, _notifier = _engine()
-    t1 = datetime(2026, 5, 15, 12, 0)
-    t2 = datetime(2026, 5, 15, 12, 30)
+    t1 = _ts(2026, 5, 15, 12, 0)
+    t2 = _ts(2026, 5, 15, 12, 30)
     scope = {"city": "Amsterdam"}
     monkeypatch.setattr(
         engine,
@@ -244,6 +315,6 @@ def test_acknowledge_is_sticky(monkeypatch):
     engine.process(metric="profit_margin", at=t2, scope=scope)
     engine.acknowledge("profit_margin", scope, at=t2)
 
-    t3 = datetime(2026, 5, 15, 13, 0)
+    t3 = _ts(2026, 5, 15, 13, 0)
     stuck = engine.process(metric="profit_margin", at=t3, scope=scope)
     assert stuck.transition.current == KPIState.ACKNOWLEDGED

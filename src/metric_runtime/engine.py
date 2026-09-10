@@ -6,13 +6,14 @@ Python API first. Configuration files for deployment.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from metric_runtime.catalog import KPICatalog
 from metric_runtime.detectors import DetectorStrategy, SeasonalZScoreDetector
 from metric_runtime.detectors.specs import build_detector
 from metric_runtime.exceptions import MetricRuntimeError, UnknownMetricError
+from metric_runtime.identity import EvaluationKey, ensure_utc
 from metric_runtime.models import (
     KPI,
     DetectorConfig,
@@ -21,13 +22,14 @@ from metric_runtime.models import (
     KPIState,
     KPIStatus,
     MeasureRef,
-    NotificationEvent,
+    MetricStateRecord,
+    OutboxEvent,
     ProcessResult,
     QualityReport,
+    StoredObservation,
 )
 from metric_runtime.notifications.base import Notifier, NullNotifier
 from metric_runtime.state import KPIStateTransition, StatePolicy, evolve_state
-from metric_runtime.stores.base import canonical_scope_key
 from metric_runtime.stores.memory import InMemoryStateStore
 
 
@@ -216,7 +218,7 @@ class KPIEngine:
             config=cfg,
             support=support,
             support_ok=support_ok,
-            as_of=at.isoformat(sep=" "),
+            as_of=at,
         )
 
     def evaluate_window(
@@ -254,7 +256,7 @@ class KPIEngine:
             config=cfg,
             support=support,
             support_ok=support_ok,
-            as_of=f"{start.isoformat(sep=' ')} → {end.isoformat(sep=' ')}",
+            as_of=end,
         )
 
     def estimate_impact_eur(
@@ -270,19 +272,17 @@ class KPIEngine:
 
         if kind == "none":
             return 0.0
-        if kind == "margin_delta":
-            return max(0.0, baseline_value - current_value)
-        if kind == "revenue_delta":
+        if kind in {"margin_delta", "revenue_delta"}:
             return max(0.0, baseline_value - current_value)
         if kind == "cost_delta":
             return max(0.0, current_value - baseline_value)
-        if kind == "orders_delta":
+        if kind == "quantity_delta":
             delta = baseline_value - current_value
             if delta <= 0:
                 return 0.0
-            if "average_order_value" in self._catalog:
-                aov = self.metric_value("average_order_value", at, filters)
-                return delta * aov
+            unit_metric = metric.impact.unit_value_metric
+            if unit_metric and unit_metric in self._catalog:
+                return delta * self.metric_value(unit_metric, at, filters)
             return delta
         return 0.0
 
@@ -365,17 +365,49 @@ class KPIEngine:
         at: datetime | None = None,
     ) -> KPIState:
         """Explicit human acknowledgement — sticky while the anomaly persists."""
+
+        from metric_runtime.identity import canonical_scope_key
+
         scope = dict(scope or {})
-        key = canonical_scope_key(scope)
-        self.state_store.set_state(metric, KPIState.ACKNOWLEDGED, key)
-        active = self.state_store.find_active_incident(metric, key)
+        scope_key = canonical_scope_key(scope)
+        stamp = ensure_utc(at) if at is not None else datetime.now(UTC)
+        previous = self.state_store.get_state_record(metric, scope_key)
+        self.state_store.set_state_record(
+            MetricStateRecord(
+                metric=metric,
+                scope_key=scope_key,
+                scope=scope,
+                state=KPIState.ACKNOWLEDGED,
+                state_since=stamp
+                if previous.state != KPIState.ACKNOWLEDGED
+                else previous.state_since,
+                updated_at=stamp,
+                resolved_at=previous.resolved_at,
+            )
+        )
+        active = self.state_store.find_active_incident(metric, scope_key)
         if active is not None:
-            stamp = (at or datetime.now()).isoformat(sep=" ")
             updated = active.model_copy(
                 update={"state": IncidentState.ACKNOWLEDGED, "updated_at": stamp}
             )
             self.state_store.upsert_incident(updated)
         return KPIState.ACKNOWLEDGED
+
+    def deliver_notifications(self, *, limit: int | None = None) -> list[OutboxEvent]:
+        """Delivery worker: send pending outbox events through the notifier."""
+
+        pending = self.state_store.list_pending_notifications()
+        if limit is not None:
+            pending = pending[:limit]
+        delivered: list[OutboxEvent] = []
+        for event in pending:
+            if event.incident is not None:
+                self.notifier.notify(event.incident)
+            assert event.id is not None
+            delivered.append(
+                self.state_store.mark_notification_delivered(event.id, at=datetime.now(UTC))
+            )
+        return delivered
 
     def process(
         self,
@@ -389,88 +421,120 @@ class KPIEngine:
         preferred_leaves: tuple[str, ...] = (),
         context: list[str] | None = None,
     ) -> ProcessResult:
-        """Authoritative runtime tick: observe → persist → state → incident → notify.
+        """Authoritative runtime tick: observe → persist → state → incident → outbox.
 
-        Idempotent per metric + scope + evaluation window (``at`` or ``start``/``end``).
+        True idempotency: EvaluationKey is computed first; a stored observation
+        short-circuits before warehouse evaluation. Notifications are enqueued
+        to an outbox (call ``deliver_notifications`` to send).
         """
+
         from metric_runtime.incidents import incident_from_investigation
 
         scope = dict(scope or {})
-        key = canonical_scope_key(scope)
         leaves = preferred_leaves or self.preferred_leaves
         policy = self.state_policy
+        eval_key = EvaluationKey.build(metric, scope=scope, at=at, start=start, end=end)
+        scope_key = eval_key.scope_key
+        eval_at = eval_key.eval_at
 
-        if start is not None and end is not None:
-            status = self.evaluate_window(metric, start, end, scope)
-            window_id = status.as_of
-            eval_at = end
-        elif at is not None:
-            status = self.evaluate(metric, at, scope)
-            window_id = status.as_of
-            eval_at = at
-        else:
-            raise MetricRuntimeError("process() requires at= or start=/end=")
-
-        previous = self.state_store.get_state(metric, key)
-        already = self.state_store.has_observation(metric, window_id, key)
-        if already:
-            current = self.state_store.get_state(metric, key)
+        existing = self.state_store.get_observation(eval_key)
+        if existing is not None:
+            record = self.state_store.get_state_record(metric, scope_key)
             return ProcessResult(
                 metric=metric,
                 scope=scope,
-                at=window_id,
-                status=status,
-                transition=KPIStateTransition(previous, current),
+                evaluation_key=eval_key,
+                at=eval_at,
+                status=existing.status,
+                transition=KPIStateTransition(record.state, record.state),
                 idempotent=True,
             )
 
-        self.state_store.append_observation(metric, status, key)
-        history = self.state_store.get_history(metric, key)
+        if start is not None and end is not None:
+            status = self.evaluate_window(metric, start, end, scope)
+        else:
+            assert at is not None
+            status = self.evaluate(metric, at, scope)
+
+        quality_ok = True if quality is None else quality.healthy
+        eligible = quality_ok
+        stored_obs = self.state_store.put_observation(
+            StoredObservation(
+                key=eval_key,
+                status=status,
+                eligible_for_state=eligible,
+                quality_healthy=None if quality is None else quality.healthy,
+                recorded_at=datetime.now(UTC),
+            )
+        )
+
+        previous_record = self.state_store.get_state_record(metric, scope_key)
+        previous = previous_record.state
+        eligible_history = [
+            item.status
+            for item in self.state_store.get_history(metric, scope_key)
+            if item.eligible_for_state
+        ]
         impact = self.estimate_impact_eur(
             metric, eval_at, status.value, status.baseline_mean, scope
         )
 
         current = evolve_state(
-            history,
+            eligible_history,
             policy=policy,
             impact_eur=impact,
             quality=quality,
             previous=previous,
         )
 
-        # Cooldown: stay RESOLVED briefly after resolution even if anomaly returns.
-        if previous == KPIState.RESOLVED and current in {
-            KPIState.DETECTED,
-            KPIState.OPEN,
-        }:
-            resolved_at = getattr(self.state_store, "get_resolved_at", lambda *_a, **_k: None)(
-                metric, key
-            )
-            if resolved_at is not None:
-                try:
-                    delta = eval_at - resolved_at
-                except TypeError:
-                    delta = timedelta(0)
+        if previous == KPIState.RESOLVED and current in {KPIState.DETECTED, KPIState.OPEN}:
+            if previous_record.resolved_at is not None:
+                delta = eval_at - ensure_utc(previous_record.resolved_at)
                 if delta < timedelta(minutes=policy.cooldown_minutes):
                     current = KPIState.RESOLVED
 
-        self.state_store.set_state(metric, current, key)
+        now = datetime.now(UTC)
+        resolved_at = previous_record.resolved_at
+        state_since = previous_record.state_since
+        if previous != current:
+            state_since = now
         if current == KPIState.RESOLVED:
-            setter = getattr(self.state_store, "set_resolved_at", None)
-            if callable(setter):
-                setter(metric, key, eval_at)
+            resolved_at = eval_at
+        self.state_store.set_state_record(
+            MetricStateRecord(
+                metric=metric,
+                scope_key=scope_key,
+                scope=scope,
+                state=current,
+                state_since=state_since,
+                updated_at=now,
+                resolved_at=resolved_at,
+            )
+        )
 
         transition = KPIStateTransition(previous, current)
         new_incidents: list = []
         updated_incidents: list = []
-        notifications: list[NotificationEvent] = []
+        notifications: list[OutboxEvent] = []
         investigation = None
+        active = self.state_store.find_active_incident(metric, scope_key)
 
-        active = self.state_store.find_active_incident(metric, key)
+        def _enqueue(event: OutboxEvent) -> OutboxEvent:
+            queued = self.state_store.enqueue_notification(event)
+            notifications.append(queued)
+            return queued
 
         if current == KPIState.OPEN:
             investigation = self.investigate(
                 metric, at=eval_at, filters=scope, preferred_leaves=leaves
+            )
+            first_detected = (
+                active.first_detected
+                if active is not None
+                else next(
+                    (h.as_of for h in eligible_history if h.anomaly and h.support_ok),
+                    status.as_of,
+                )
             )
             draft = incident_from_investigation(
                 self,
@@ -479,14 +543,7 @@ class KPIEngine:
                 at=eval_at,
                 inv=investigation,
                 state=IncidentState.OPEN,
-                first_detected=(
-                    active.first_detected
-                    if active is not None
-                    else next(
-                        (h.as_of for h in history if h.anomaly and h.support_ok),
-                        window_id,
-                    )
-                ),
+                first_detected=first_detected,
                 estimated_impact=impact,
                 persistence_windows=policy.persistence,
                 context=context,
@@ -495,16 +552,17 @@ class KPIEngine:
             if active is None:
                 stored = self.state_store.upsert_incident(draft)
                 new_incidents.append(stored)
-                event = NotificationEvent(
-                    kind="incident_opened",
-                    incident=stored,
-                    metric=metric,
-                    previous_state=previous,
-                    current_state=current,
-                    message=f"Opened incident for {metric}",
+                _enqueue(
+                    OutboxEvent(
+                        kind="incident_opened",
+                        incident=stored,
+                        metric=metric,
+                        previous_state=previous,
+                        current_state=current,
+                        message=f"Opened incident for {metric}",
+                        created_at=now,
+                    )
                 )
-                notifications.append(event)
-                self.notifier.notify(stored)
             else:
                 merged = draft.model_copy(
                     update={
@@ -514,7 +572,6 @@ class KPIEngine:
                         "state": IncidentState.OPEN,
                     }
                 )
-                # Only notify on meaningful incident field changes while OPEN.
                 meaningful = (
                     previous != current
                     or active.explanatory_kpi != merged.explanatory_kpi
@@ -523,67 +580,63 @@ class KPIEngine:
                 )
                 stored = self.state_store.upsert_incident(merged)
                 updated_incidents.append(stored)
-                if meaningful and previous != current:
-                    event = NotificationEvent(
-                        kind="incident_updated",
-                        incident=stored,
-                        metric=metric,
-                        previous_state=previous,
-                        current_state=current,
-                        message=f"Updated incident for {metric}",
+                if meaningful:
+                    _enqueue(
+                        OutboxEvent(
+                            kind="incident_updated",
+                            incident=stored,
+                            metric=metric,
+                            previous_state=previous,
+                            current_state=current,
+                            message=f"Updated incident for {metric}",
+                            created_at=now,
+                        )
                     )
-                    notifications.append(event)
-                    self.notifier.notify(stored)
 
         elif current == KPIState.RESOLVED and active is not None:
             resolved = active.model_copy(
-                update={
-                    "state": IncidentState.RESOLVED,
-                    "updated_at": eval_at.isoformat(sep=" "),
-                }
+                update={"state": IncidentState.RESOLVED, "updated_at": eval_at}
             )
             stored = self.state_store.upsert_incident(resolved)
             updated_incidents.append(stored)
             if previous != current:
-                event = NotificationEvent(
-                    kind="incident_resolved",
-                    incident=stored,
+                _enqueue(
+                    OutboxEvent(
+                        kind="incident_resolved",
+                        incident=stored,
+                        metric=metric,
+                        previous_state=previous,
+                        current_state=current,
+                        message=f"Resolved incident for {metric}",
+                        created_at=now,
+                    )
+                )
+
+        elif current == KPIState.SUPPRESSED and previous != current:
+            _enqueue(
+                OutboxEvent(
+                    kind="state_changed",
                     metric=metric,
                     previous_state=previous,
                     current_state=current,
-                    message=f"Resolved incident for {metric}",
+                    message=f"Suppressed {metric} due to data quality",
+                    created_at=now,
                 )
-                notifications.append(event)
-                self.notifier.notify(stored)
-
-        elif current == KPIState.SUPPRESSED and previous != current:
-            event = NotificationEvent(
-                kind="state_changed",
-                metric=metric,
-                previous_state=previous,
-                current_state=current,
-                message=f"Suppressed {metric} due to data quality",
             )
-            notifications.append(event)
             if active is not None:
                 suppressed = active.model_copy(
-                    update={
-                        "state": IncidentState.SUPPRESSED,
-                        "updated_at": eval_at.isoformat(sep=" "),
-                    }
+                    update={"state": IncidentState.SUPPRESSED, "updated_at": eval_at}
                 )
                 stored = self.state_store.upsert_incident(suppressed)
                 updated_incidents.append(stored)
-                self.notifier.notify(stored)
 
-        elif current == KPIState.DETECTED and previous == KPIState.NORMAL and active is None:
-            # Detection alone is not an alert — no notification.
-            pass
+        _ = stored_obs  # persisted before side effects
 
         return ProcessResult(
             metric=metric,
             scope=scope,
-            at=window_id,
+            evaluation_key=eval_key,
+            at=eval_at,
             status=status,
             transition=transition,
             new_incidents=new_incidents,

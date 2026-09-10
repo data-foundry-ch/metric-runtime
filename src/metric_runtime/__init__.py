@@ -10,6 +10,7 @@ from metric_runtime.detectors import (
     ThresholdDetector,
 )
 from metric_runtime.engine import KPIEngine
+from metric_runtime.identity import EvaluationKey
 from metric_runtime.incidents import open_smart_incident
 from metric_runtime.investigation import investigate_metric, investigate_window
 from metric_runtime.models import (
@@ -22,6 +23,7 @@ from metric_runtime.models import (
     KPIObservation,
     KPIState,
     KPIStatus,
+    MetricStateRecord,
     ProcessResult,
 )
 from metric_runtime.state import KPIStateTransition, StatePolicy
@@ -36,8 +38,10 @@ __all__ = [
     "KPIStateTransition",
     "KPIStatus",
     "Detection",
+    "EvaluationKey",
     "Incident",
     "InvestigationResult",
+    "MetricStateRecord",
     "ProcessResult",
     "Directionality",
     "Formula",
