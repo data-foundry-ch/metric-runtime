@@ -102,6 +102,19 @@ One runtime evaluation is identified by:
 encoded as an `EvaluationKey`. The same key means the same logical tick —
 retries and concurrent workers must not invent a second committed result.
 
+**Time semantics**
+
+- **effective_at** — business time of the evaluation window (`EvaluationKey.eval_at`,
+  also `ProcessResult.at`)
+- **processed_at** — wall-clock commit time (`EvaluationRecord.committed_at`,
+  `MetricStateRecord.updated_at`)
+
+Metric-state application for one `(metric, scope)` stream is **monotonic in
+effective_at**. A later window waits for earlier in-flight windows; an older
+window arriving after a newer commit raises `StaleEvaluationError`.
+
+Different metrics or scopes proceed concurrently (separate streams).
+
 ## Atomic runtime commit
 
 For one `EvaluationKey`, the atomic unit is:

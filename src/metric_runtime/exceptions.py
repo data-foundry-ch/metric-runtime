@@ -41,3 +41,12 @@ class UnsupportedConnectionTypeError(ConfigurationError):
 
 class EvaluationInProgressError(MetricRuntimeError):
     """Another worker currently owns this EvaluationKey."""
+
+
+class StaleEvaluationError(MetricRuntimeError):
+    """An older evaluation window cannot overwrite newer metric state.
+
+    Operational processing for one (metric, scope) stream is monotonic in
+    ``effective_at`` (evaluation window time). A late or out-of-order older
+    window is rejected after a newer window has already been committed.
+    """

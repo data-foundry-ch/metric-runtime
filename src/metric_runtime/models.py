@@ -317,7 +317,14 @@ class StoredObservation(BaseModel):
 
 
 class MetricStateRecord(BaseModel):
-    """Operational state for one metric + scope."""
+    """Operational state for one metric + scope stream.
+
+    Time semantics:
+    - ``last_evaluation_at`` / evaluation windows use **effective_at** — the
+      business time of the observation window (``EvaluationKey.eval_at``).
+    - ``updated_at`` is **processed_at** — when the runtime committed this
+      state row (wall clock).
+    """
 
     metric: str
     scope_key: str = ""
@@ -330,6 +337,8 @@ class MetricStateRecord(BaseModel):
     resolved_at: datetime | None = None
     detection_streak: int = 0
     healthy_streak: int = 0
+    last_evaluation_at: datetime | None = None
+    version: int = 0
 
     @field_validator(
         "state_since",
@@ -337,6 +346,7 @@ class MetricStateRecord(BaseModel):
         "opened_at",
         "acknowledged_at",
         "resolved_at",
+        "last_evaluation_at",
         mode="before",
     )
     @classmethod
@@ -522,7 +532,11 @@ NotificationEvent = OutboxEvent
 
 
 class EvaluationRecord(BaseModel):
-    """Authoritative committed result for one EvaluationKey."""
+    """Authoritative committed result for one EvaluationKey.
+
+    ``effective_at`` is the evaluation window time (business time).
+    ``committed_at`` / ``processed_at`` is when the runtime committed.
+    """
 
     key: EvaluationKey
     observation: StoredObservation
@@ -535,15 +549,26 @@ class EvaluationRecord(BaseModel):
     updated_incident_ids: list[str] = Field(default_factory=list)
     investigation: InvestigationResult | None = None
     committed_at: datetime
+    effective_at: datetime | None = None
 
-    @field_validator("committed_at", mode="before")
+    @field_validator("committed_at", "effective_at", mode="before")
     @classmethod
-    def _coerce_committed_at(cls, value: Any) -> datetime:
+    def _coerce_committed_at(cls, value: Any) -> Any:
+        if value is None or value == "":
+            return None
         return parse_datetime(value)
+
+    @property
+    def processed_at(self) -> datetime:
+        return self.committed_at
 
 
 class ProcessResult(BaseModel):
-    """Outcome of one authoritative runtime tick."""
+    """Outcome of one authoritative runtime tick.
+
+    ``at`` / ``effective_at`` is the evaluation window time.
+    ``processed_at`` is when the result was committed (if available).
+    """
 
     metric: str
     scope: dict[str, str] = Field(default_factory=dict)
@@ -557,8 +582,15 @@ class ProcessResult(BaseModel):
     investigation: InvestigationResult | None = None
     idempotent: bool = False
     evaluation_record: EvaluationRecord | None = None
+    processed_at: datetime | None = None
 
-    @field_validator("at", mode="before")
+    @field_validator("at", "processed_at", mode="before")
     @classmethod
-    def _coerce_at(cls, value: Any) -> datetime:
+    def _coerce_at(cls, value: Any) -> Any:
+        if value is None or value == "":
+            return None
         return parse_datetime(value)
+
+    @property
+    def effective_at(self) -> datetime:
+        return self.at

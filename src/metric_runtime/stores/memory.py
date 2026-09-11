@@ -8,7 +8,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
-from metric_runtime.exceptions import MetricRuntimeError
+from metric_runtime.exceptions import (
+    EvaluationInProgressError,
+    MetricRuntimeError,
+    StaleEvaluationError,
+)
 from metric_runtime.identity import EvaluationKey, canonical_scope_key, ensure_utc
 from metric_runtime.models import (
     EvaluationRecord,
@@ -161,6 +165,13 @@ class _InMemoryTransaction:
                 if obs_id not in ids:
                     ids.append(obs_id)
             for state_key, state_record in self._states.items():
+                existing = self._store._states.get(state_key)
+                if existing is not None and state_record.version != existing.version + 1:
+                    raise StaleEvaluationError(
+                        f"Optimistic version conflict for {state_key[0]}/"
+                        f"{state_key[1]}: expected version {existing.version + 1}, "
+                        f"got {state_record.version}"
+                    )
                 self._store._states[state_key] = state_record
             for incident_id, incident in self._incidents.items():
                 self._store._incidents[incident_id] = incident
@@ -201,6 +212,10 @@ class InMemoryStateStore:
         self._outbox_by_key: dict[str, str] = {}
         self._evaluations: dict[str, EvaluationRecord] = {}
         self._claims: dict[str, str] = {}
+        # identity -> effective_at for in-flight evaluations per stream.
+        self._stream_inflight: dict[tuple[str, str], dict[str, datetime]] = {}
+        self._stream_busy: dict[tuple[str, str], str] = {}
+        self._stream_conditions: dict[tuple[str, str], threading.Condition] = {}
         self._incident_seq = 0
         self._outbox_seq = 0
         # Optional hook for failure-injection tests: called inside commit.
@@ -227,6 +242,13 @@ class InMemoryStateStore:
         ]
 
     def append_observation(self, metric: str, status: KPIStatus, scope_key: str = "") -> None:
+        import warnings
+
+        warnings.warn(
+            "append_observation is deprecated; use process()/transaction staging",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         key = EvaluationKey.build(metric, scope={}, at=status.as_of)
         object.__setattr__(key, "scope_key", scope_key)
         self.put_observation(
@@ -239,6 +261,13 @@ class InMemoryStateStore:
         )
 
     def has_observation(self, metric: str, as_of: str, scope_key: str = "") -> bool:
+        import warnings
+
+        warnings.warn(
+            "has_observation is deprecated; use get_observation(EvaluationKey)",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         for item in self.get_history(metric, scope_key):
             if item.key.window_id == as_of or item.status.as_of.isoformat() == as_of:
                 return True
@@ -255,6 +284,8 @@ class InMemoryStateStore:
             state=KPIState.NORMAL,
             state_since=now,
             updated_at=now,
+            last_evaluation_at=None,
+            version=0,
         )
 
     def set_state_record(self, record: MetricStateRecord) -> None:
@@ -263,15 +294,25 @@ class InMemoryStateStore:
             tx.commit()
 
     def get_state(self, metric: str, scope_key: str = "") -> KPIState:
+        """Convenience read — prefer ``get_state_record`` for durable fields."""
         return self.get_state_record(metric, scope_key).state
 
     def set_state(self, metric: str, state: KPIState, scope_key: str = "") -> None:
+        import warnings
+
+        warnings.warn(
+            "set_state is deprecated; mutate MetricStateRecord via process()/set_state_record",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         now = datetime.now(UTC)
         previous = self._states.get((metric, scope_key))
         resolved_at = previous.resolved_at if previous is not None else None
         opened_at = previous.opened_at if previous is not None else None
         acknowledged_at = previous.acknowledged_at if previous is not None else None
         state_since = previous.state_since if previous is not None else now
+        last_evaluation_at = previous.last_evaluation_at if previous is not None else None
+        version = previous.version if previous is not None else 0
         if previous is None or previous.state != state:
             state_since = now
         if state == KPIState.RESOLVED:
@@ -291,6 +332,8 @@ class InMemoryStateStore:
                 opened_at=opened_at,
                 acknowledged_at=acknowledged_at,
                 resolved_at=resolved_at,
+                last_evaluation_at=last_evaluation_at,
+                version=version + 1,
             )
         )
 
@@ -369,6 +412,16 @@ class InMemoryStateStore:
     def get_committed_result(self, key: EvaluationKey) -> EvaluationRecord | None:
         return self._evaluations.get(key.identity)
 
+    def _stream_id(self, key: EvaluationKey) -> tuple[str, str]:
+        return (key.metric, key.scope_key)
+
+    def _stream_condition(self, stream: tuple[str, str]) -> threading.Condition:
+        cond = self._stream_conditions.get(stream)
+        if cond is None:
+            cond = threading.Condition(self._lock)
+            self._stream_conditions[stream] = cond
+        return cond
+
     def claim_evaluation(self, key: EvaluationKey) -> EvaluationClaim:
         with self._lock:
             existing = self._evaluations.get(key.identity)
@@ -382,6 +435,9 @@ class InMemoryStateStore:
                 return EvaluationClaim(EvaluationClaimStatus.IN_PROGRESS, key=key)
             token = uuid.uuid4().hex
             self._claims[key.identity] = token
+            stream = self._stream_id(key)
+            self._stream_inflight.setdefault(stream, {})[key.identity] = ensure_utc(key.eval_at)
+            self._stream_condition(stream).notify_all()
             return EvaluationClaim(
                 EvaluationClaimStatus.ACQUIRED,
                 key=key,
@@ -396,6 +452,60 @@ class InMemoryStateStore:
             if token is not None and current != token:
                 return
             del self._claims[key.identity]
+            stream = self._stream_id(key)
+            inflight = self._stream_inflight.get(stream)
+            if inflight is not None:
+                inflight.pop(key.identity, None)
+                if not inflight:
+                    self._stream_inflight.pop(stream, None)
+            self._stream_condition(stream).notify_all()
+
+    @contextmanager
+    def ordered_stream_commit(
+        self,
+        key: EvaluationKey,
+        *,
+        timeout: float | None = 30.0,
+    ) -> Iterator[None]:
+        """Serialize metric-state commits by effective_at for one stream."""
+        stream = self._stream_id(key)
+        effective = ensure_utc(key.eval_at)
+        cond = self._stream_condition(stream)
+        with cond:
+            while True:
+                existing = self._states.get(stream)
+                last = (
+                    ensure_utc(existing.last_evaluation_at)
+                    if existing is not None and existing.last_evaluation_at is not None
+                    else None
+                )
+                if last is not None and last >= effective:
+                    raise StaleEvaluationError(
+                        f"Stale evaluation for {key.metric} scope={key.scope_key}: "
+                        f"effective_at={effective.isoformat()} is not after "
+                        f"last_evaluation_at={last.isoformat()}"
+                    )
+                earlier = [
+                    ident
+                    for ident, at in self._stream_inflight.get(stream, {}).items()
+                    if at < effective and ident != key.identity
+                ]
+                busy = self._stream_busy.get(stream)
+                if not earlier and busy is None:
+                    self._stream_busy[stream] = key.identity
+                    break
+                if not cond.wait(timeout=timeout):
+                    raise EvaluationInProgressError(
+                        f"Timed out waiting for earlier evaluations on "
+                        f"{key.metric}/{key.scope_key} before {effective.isoformat()}"
+                    )
+        try:
+            yield
+        finally:
+            with cond:
+                if self._stream_busy.get(stream) == key.identity:
+                    del self._stream_busy[stream]
+                cond.notify_all()
 
     @contextmanager
     def transaction(self) -> Iterator[_InMemoryTransaction]:
@@ -412,4 +522,11 @@ class InMemoryStateStore:
 
     def commit_transaction(self, tx: _InMemoryTransaction) -> None:
         """Deprecated helper — use ``tx.commit()``."""
+        import warnings
+
+        warnings.warn(
+            "commit_transaction is deprecated; call tx.commit() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         tx.commit()
