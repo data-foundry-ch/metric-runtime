@@ -10,14 +10,32 @@ application/example layer — not here.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from metric_runtime.exceptions import MetricRuntimeError
+from metric_runtime.identity import ensure_utc
 from metric_runtime.models import Formula, MeasureRef, coerce_measure_ref
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _bind_timestamp(value: datetime) -> datetime:
+    """Bind core timezone-aware timestamps to DuckDB TIMESTAMP (UTC wall clock)."""
+    return ensure_utc(value).replace(tzinfo=None)
+
+
+def _from_duckdb_timestamp(value: datetime | str) -> datetime:
+    """Interpret DuckDB TIMESTAMP values as UTC."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return ensure_utc(value)
+    parsed = datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return ensure_utc(parsed)
 
 
 def quote_identifier(name: str) -> str:
@@ -144,13 +162,13 @@ class DuckDBExecutor:
 
         if at is not None:
             clauses.append(f"{ts} = ?")
-            params.append(at)
+            params.append(_bind_timestamp(at))
         if start is not None:
             clauses.append(f"{ts} >= ?")
-            params.append(start)
+            params.append(_bind_timestamp(start))
         if end is not None:
             clauses.append(f"{ts} <= ?")
-            params.append(end)
+            params.append(_bind_timestamp(end))
         if not clauses:
             clauses.append("1 = 1")
 
@@ -238,9 +256,7 @@ class DuckDBExecutor:
         latest = self.con.execute(f"SELECT MAX({self._ts_sql}) FROM {self._fact_sql}").fetchone()[0]
         if latest is None:
             return None
-        if isinstance(latest, datetime):
-            return latest
-        return datetime.fromisoformat(str(latest))
+        return _from_duckdb_timestamp(latest)
 
     def row_count_at(self, at: datetime) -> int:
         row = self.con.execute(
@@ -249,6 +265,6 @@ class DuckDBExecutor:
             FROM {self._fact_sql}
             WHERE {self._ts_sql} = ?
             """,
-            [at],
+            [_bind_timestamp(at)],
         ).fetchone()
         return int(row[0] or 0)

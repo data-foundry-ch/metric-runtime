@@ -66,7 +66,8 @@ def rank_explanatory_candidates(
                 name, at, status.value, status.baseline_mean, filters
             )
         leaf_rank = 0 if name in preferred_leaves else 1
-        score = float(depth) * 10.0 - leaf_rank * 100.0 + min(status.severity, 50.0)
+        # Preferred leaves are a weak tie-breaker only (±1), not a hard bias.
+        score = float(depth) * 10.0 + min(status.severity, 50.0) - leaf_rank * 1.0
         candidates.append(
             ExplanatoryCandidate(
                 name=name,

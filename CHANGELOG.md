@@ -36,9 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Split observation / metric-state / incident store protocols (composed by ``StateStore``)
 - ``KPIStateTransition`` and resolve / acknowledge / suppress semantics
 - ``StatePolicy`` wired from ``metric-runtime.yaml`` into ``build_runtime``
-- True idempotency via ``EvaluationKey`` + ``get_observation`` before warehouse evaluation
+- True idempotency via ``EvaluationKey`` + committed ``EvaluationRecord``
 - Notification outbox (``enqueue`` then ``deliver_notifications``)
-- ``MetricStateRecord`` with ``resolved_at`` / ``state_since``
+- ``MetricStateRecord`` with lifecycle metadata and streaks
 - Scope identity via canonical JSON + SHA-256
-- Timezone-aware datetime fields on observations / incidents
+- Timezone-aware datetime fields (naive datetimes rejected)
 - Impact ``quantity_delta`` + ``unit_value_metric`` (no hardcoded ``average_order_value``)
+- Atomic runtime transactions (``RuntimeTransaction`` / ``TransactionalRuntimeStore``)
+- Evaluation claims for concurrency-safe commits
+- Strict config duration parsing (``30s`` / ``15m`` / ``2h`` / ``1d``)
+- Quality gaps break consecutive detection streaks
+- ``KPIEngine.process`` commits observation + state + incident + outbox atomically
+- External notification delivery is explicitly at-least-once; notifiers receive ``idempotency_key``
+- Preferred-leaf hints are a weak tie-breaker only in investigation ranking
+- ``ProcessResult.transition`` is a typed ``KPIStateTransition`` (no ``arbitrary_types_allowed``)

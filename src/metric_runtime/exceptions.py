@@ -37,3 +37,7 @@ class UnknownConnectionError(ConfigurationError):
 
 class UnsupportedConnectionTypeError(ConfigurationError):
     """Connection type is not implemented in this version."""
+
+
+class EvaluationInProgressError(MetricRuntimeError):
+    """Another worker currently owns this EvaluationKey."""

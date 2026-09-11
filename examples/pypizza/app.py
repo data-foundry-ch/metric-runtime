@@ -11,7 +11,7 @@ app = marimo.App(
 @app.cell
 def _():
     import inspect
-    from datetime import datetime, timedelta
+    from datetime import UTC, datetime, timedelta
     from pathlib import Path
 
     import altair as alt
@@ -81,6 +81,7 @@ def _():
         SupportRequirement,
         TALK_GRAPH_METRICS,
         ThresholdDetector,
+        UTC,
         alt,
         build_catalog,
         basket_distribution,
@@ -110,7 +111,7 @@ def _():
 
 
 @app.cell
-def _(KPIEngine, Path, build_catalog, datetime, duckdb):
+def _(KPIEngine, Path, UTC, build_catalog, datetime, duckdb):
     root = Path(__file__).resolve().parent
     db_path = root / "data" / "pypizza.duckdb"
     if not db_path.exists():
@@ -120,8 +121,8 @@ def _(KPIEngine, Path, build_catalog, datetime, duckdb):
     con = duckdb.connect(str(db_path), read_only=True)
     catalog = build_catalog()
     engine = KPIEngine(catalog, connection=con, fact_table="pypizza_halfhourly")
-    CAMPAIGN_START = datetime(2026, 5, 15, 11, 30)
-    CAMPAIGN_END = datetime(2026, 5, 17, 13, 30)
+    CAMPAIGN_START = datetime(2026, 5, 15, 11, 30, tzinfo=UTC)
+    CAMPAIGN_END = datetime(2026, 5, 17, 13, 30, tzinfo=UTC)
     AMS_LUNCH = {"city": "Amsterdam", "meal_period": "lunch"}
     return AMS_LUNCH, CAMPAIGN_END, CAMPAIGN_START, catalog, engine
 
@@ -1161,6 +1162,7 @@ def _(
     alt,
     check_data_quality,
     datetime,
+    UTC,
     engine,
     inv,
     kicker,
@@ -1169,7 +1171,7 @@ def _(
     open_smart_incident,
     pct,
 ):
-    quality = check_data_quality(engine, datetime(2026, 5, 15, 12, 30))
+    quality = check_data_quality(engine, datetime(2026, 5, 15, 12, 30, tzinfo=UTC))
     incident = open_smart_incident(
         engine,
         center_kpi="weekend_profit",
@@ -1177,7 +1179,7 @@ def _(
             "city": "Amsterdam",
             "meal_period": "lunch",
         },
-        start=datetime(2026, 5, 15, 11, 30),
+        start=datetime(2026, 5, 15, 11, 30, tzinfo=UTC),
         windows=12,
         persistence=2,
         min_impact_eur=40,
@@ -1188,8 +1190,8 @@ def _(
         "average_order_value", CAMPAIGN_START, CAMPAIGN_END, AMS_LUNCH
     ).baseline_mean
 
-    pre_start = datetime(2026, 5, 8, 11, 30)
-    pre_end = datetime(2026, 5, 10, 13, 30)
+    pre_start = datetime(2026, 5, 8, 11, 30, tzinfo=UTC)
+    pre_end = datetime(2026, 5, 10, 13, 30, tzinfo=UTC)
     before = basket_distribution(engine, pre_start, pre_end, AMS_LUNCH)
     during = basket_distribution(
         engine,
@@ -1580,6 +1582,7 @@ def _(
     AMS_LUNCH,
     CAMPAIGN_START,
     IncidentState,
+    UTC,
     check_data_quality,
     datetime,
     engine,
@@ -1671,7 +1674,7 @@ def _(
     _avoidable = sum(
         _delta for _when, _delta in _days if _when.date() > _alert_at.date()
     )
-    _found_out = datetime(2026, 5, 18, 9, 12)
+    _found_out = datetime(2026, 5, 18, 9, 12, tzinfo=UTC)
     _gap = _found_out - _alert_at
 
     _cells = "".join(

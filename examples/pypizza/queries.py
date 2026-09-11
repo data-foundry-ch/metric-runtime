@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from metric_runtime.engine import KPIEngine
 
@@ -19,6 +19,9 @@ def nearby_events(
     filters = filters or {}
     start = at - timedelta(hours=hours)
     end = at + timedelta(hours=hours)
+    if start.tzinfo is not None:
+        start = start.astimezone(UTC).replace(tzinfo=None)
+        end = end.astimezone(UTC).replace(tzinfo=None)
 
     clauses = ["event_ts BETWEEN ? AND ?"]
     params: list[object] = [start, end]

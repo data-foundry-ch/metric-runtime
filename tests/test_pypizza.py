@@ -38,10 +38,10 @@ from impact import campaign_impact_decomposition  # noqa: E402
 from quality import check_data_quality  # noqa: E402
 from queries import basket_distribution  # noqa: E402
 
-START = datetime(2026, 5, 15, 11, 30)
-END = datetime(2026, 5, 17, 13, 30)
-PRE_START = datetime(2026, 5, 8, 11, 30)
-PRE_END = datetime(2026, 5, 10, 13, 30)
+START = datetime(2026, 5, 15, 11, 30, tzinfo=UTC)
+END = datetime(2026, 5, 17, 13, 30, tzinfo=UTC)
+PRE_START = datetime(2026, 5, 8, 11, 30, tzinfo=UTC)
+PRE_END = datetime(2026, 5, 10, 13, 30, tzinfo=UTC)
 AMS_LUNCH = {"city": "Amsterdam", "meal_period": "lunch"}
 
 
@@ -131,7 +131,7 @@ def test_smart_alert_owner_is_promotions(engine: KPIEngine):
         engine,
         center_kpi="weekend_profit",
         scope=AMS_LUNCH,
-        start=datetime(2026, 5, 15, 11, 30),
+        start=datetime(2026, 5, 15, 11, 30, tzinfo=UTC),
         windows=12,
         persistence=2,
         min_impact_eur=40,
@@ -157,7 +157,7 @@ def test_quality_blocks_incident(engine: KPIEngine):
         open_pypizza_incident(
             engine,
             scope=AMS_LUNCH,
-            start=datetime(2026, 5, 15, 11, 30),
+            start=datetime(2026, 5, 15, 11, 30, tzinfo=UTC),
             windows=8,
             quality=bad,
         )
@@ -185,7 +185,7 @@ def test_detector_swap_without_catalog_change(engine: KPIEngine):
 
 
 def test_state_requires_persistence(engine: KPIEngine):
-    st = engine.evaluate("weekend_profit", datetime(2026, 5, 15, 12, 0), AMS_LUNCH)
+    st = engine.evaluate("weekend_profit", datetime(2026, 5, 15, 12, 0, tzinfo=UTC), AMS_LUNCH)
     one = evolve_state(
         [st],
         policy=StatePolicy(persistence=2, min_impact_eur=1),
@@ -202,7 +202,7 @@ def test_state_requires_persistence(engine: KPIEngine):
 
 
 def test_data_quality_healthy(engine: KPIEngine):
-    q = check_data_quality(engine, datetime(2026, 5, 17, 12, 0))
+    q = check_data_quality(engine, datetime(2026, 5, 17, 12, 0, tzinfo=UTC))
     assert q.healthy
 
 
@@ -237,7 +237,7 @@ def test_pypizza_process_idempotent_single_incident(engine: KPIEngine):
         ),
     )
     scope = AMS_LUNCH
-    cursor = datetime(2026, 5, 15, 11, 30)
+    cursor = datetime(2026, 5, 15, 11, 30, tzinfo=UTC)
     opened = None
     for _ in range(24):
         result = runtime.process(metric="weekend_profit", at=cursor, scope=scope)

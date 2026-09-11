@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from metric_runtime.catalog import KPICatalog
+from metric_runtime.config.duration import parse_duration_minutes
 from metric_runtime.config.loader import (
     load_connections_config,
     load_project_config,
@@ -170,12 +171,7 @@ def build_runtime(
 
 
 def state_policy_from_project(project: MetricRuntimeProjectConfig) -> StatePolicy:
-    cooldown = project.state.cooldown
-    minutes = 30
-    if cooldown.endswith("m"):
-        minutes = int(cooldown[:-1])
-    elif cooldown.endswith("h"):
-        minutes = int(cooldown[:-1]) * 60
+    minutes = parse_duration_minutes(project.state.cooldown, field="state.cooldown")
     return StatePolicy(
         detections_before_open=project.state.detections_before_open,
         resolve_after_healthy_windows=project.state.resolve_after_healthy_windows,

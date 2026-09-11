@@ -17,6 +17,7 @@ from metric_runtime.models import (
     KPI,
     Detection,
     Directionality,
+    EvaluationRecord,
     Formula,
     Incident,
     InvestigationResult,
@@ -24,6 +25,7 @@ from metric_runtime.models import (
     KPIState,
     KPIStatus,
     MetricStateRecord,
+    OutboxEvent,
     ProcessResult,
 )
 from metric_runtime.state import KPIStateTransition, StatePolicy
@@ -39,9 +41,11 @@ __all__ = [
     "KPIStatus",
     "Detection",
     "EvaluationKey",
+    "EvaluationRecord",
     "Incident",
     "InvestigationResult",
     "MetricStateRecord",
+    "OutboxEvent",
     "ProcessResult",
     "Directionality",
     "Formula",

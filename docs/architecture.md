@@ -80,8 +80,8 @@ useful explanatory KPI, not the owner of the top-level red number.
 
 ## 10. Notification adapters
 
-`Notifier.notify(incident)` is an extension point. Core does not depend on
-Slack/Teams SDKs.
+`Notifier.notify(incident, *, idempotency_key=...)` is an extension point.
+Core does not depend on Slack/Teams SDKs.
 
 ## 11. State persistence
 
@@ -92,6 +92,64 @@ a persistent store (e.g. Postgres) — not shipped in v0.1.
 
 Warehouse/lake = historical business facts.
 StateStore = operational conclusions.
+
+## Evaluation identity
+
+One runtime evaluation is identified by:
+
+`(metric, scope, evaluation window)`
+
+encoded as an `EvaluationKey`. The same key means the same logical tick —
+retries and concurrent workers must not invent a second committed result.
+
+## Atomic runtime commit
+
+For one `EvaluationKey`, the atomic unit is:
+
+- observation
+- metric state record
+- incident mutation (if any)
+- outbox event(s) (if any)
+- committed `EvaluationRecord`
+
+Either all become visible, or none do. `KPIEngine.process()` stages these
+inside `store.transaction()` and commits once.
+
+## Idempotency
+
+If an `EvaluationKey` is already committed, `process()` returns the stored
+`EvaluationRecord` / `ProcessResult` and does **not** re-run the executor,
+detector, state machine, or outbox creation.
+
+## Concurrency
+
+Only one worker may own an `EvaluationKey` for transition processing
+(`claim_evaluation`). Concurrent callers receive either the committed result
+or `EvaluationInProgressError`.
+
+## Transactional outbox
+
+The state transaction persists notification **intent** only
+(`OutboxEvent` with a stable `event_key`). External delivery runs afterward via
+`deliver_notifications()`.
+
+## Delivery guarantees
+
+| Layer | Guarantee |
+|---|---|
+| Runtime transition | Idempotent — single committed result per `EvaluationKey` |
+| Outbox intent | Deduplicated per meaningful transition (`event_key`) |
+| External notifier | At-least-once unless the notifier honors `idempotency_key` |
+
+## Quality and persistence streaks
+
+Ineligible (quality-failed) windows are visible to state evolution. They
+**break** consecutive detection streaks; they do not bridge anomalies across a
+gap.
+
+## Timezone policy
+
+Core timestamps must be timezone-aware. Naive datetimes are rejected.
 
 ## 12. Execution backends
 

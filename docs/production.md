@@ -21,6 +21,41 @@ cloud container jobs.
 The metric-runtime worker can remain a disposable job. Persistent operational
 state should live in a StateStore you control.
 
+## Authoritative worker lifecycle
+
+```
+scheduler / trigger
+        ↓
+runtime worker
+        ↓
+claim EvaluationKey
+        ↓
+calculate (observation / detector / state / investigation)
+        ↓
+atomic DB transaction
+        ├── observation
+        ├── metric state
+        ├── incident
+        └── outbox intent
+        ↓
+commit
+
+separate delivery worker
+        ↓
+Slack / Teams / email / webhook
+```
+
+A future Postgres adapter can implement both:
+
+- transactional runtime persistence (`transaction()`)
+- evaluation locking / claiming (`claim_evaluation`)
+
+without changing `KPIEngine.process()` semantics.
+
+External notification delivery stays **outside** the state transaction
+(transactional outbox). Delivery is at-least-once unless the notifier
+honors `idempotency_key`.
+
 ## Execution modes
 
 | Mode | How observations arrive |

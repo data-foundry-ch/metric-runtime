@@ -11,6 +11,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
+from metric_runtime.config.duration import parse_duration
+
 
 class ProjectMeta(BaseModel):
     name: str = "metric-runtime"
@@ -27,6 +29,12 @@ class RuntimeConfig(BaseModel):
     default_profile: str = "local"
     fact_table: str | None = None
 
+    @field_validator("evaluation_interval")
+    @classmethod
+    def _validate_interval(cls, value: str) -> str:
+        parse_duration(value, field="runtime.evaluation_interval")
+        return value
+
 
 class InvestigationConfig(BaseModel):
     max_depth: int = 5
@@ -38,6 +46,12 @@ class StatePolicyConfig(BaseModel):
     resolve_after_healthy_windows: int = 2
     cooldown: str = "30m"
     min_impact_eur: float = 50.0
+
+    @field_validator("cooldown")
+    @classmethod
+    def _validate_cooldown(cls, value: str) -> str:
+        parse_duration(value, field="state.cooldown")
+        return value
 
 
 class MetricRuntimeProjectConfig(BaseModel):
