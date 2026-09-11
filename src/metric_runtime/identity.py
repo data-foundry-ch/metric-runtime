@@ -10,26 +10,51 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-def ensure_utc(value: datetime) -> datetime:
-    """Normalize datetimes to timezone-aware UTC."""
+class NaiveDatetimeError(ValueError):
+    """Raised when a timezone-naive datetime is passed to the core runtime."""
+
+
+def require_aware(value: datetime, *, field: str = "datetime") -> datetime:
+    """Require timezone-aware datetimes; normalize to UTC."""
+    if not isinstance(value, datetime):
+        raise TypeError(f"{field} must be a datetime, got {type(value)!r}")
     if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
+        raise NaiveDatetimeError(
+            f"{field} must be timezone-aware (got naive {value!r}). "
+            "Pass an explicit tzinfo such as datetime.UTC."
+        )
     return value.astimezone(UTC)
 
 
-def parse_datetime(value: Any) -> datetime:
-    """Parse ISO strings / datetimes into timezone-aware UTC."""
+def ensure_utc(value: datetime) -> datetime:
+    """Normalize timezone-aware datetimes to UTC (rejects naive)."""
+    return require_aware(value)
+
+
+def parse_datetime(value: Any, *, field: str = "datetime") -> datetime:
+    """Parse ISO strings / aware datetimes into timezone-aware UTC.
+
+    Naive datetime objects are rejected. ISO strings without an offset are
+    rejected as well — callers must include ``Z`` or an explicit offset.
+    """
     if isinstance(value, datetime):
-        return ensure_utc(value)
+        return require_aware(value, field=field)
     if isinstance(value, str):
         text = value.strip()
+        if not text:
+            raise ValueError(f"{field} must not be empty")
         if " → " in text:
-            # Legacy window label: take the end bound.
             text = text.split(" → ", 1)[1].strip()
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
-        return ensure_utc(datetime.fromisoformat(text))
-    raise TypeError(f"Expected datetime or ISO string, got {type(value)!r}")
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            raise NaiveDatetimeError(
+                f"{field} ISO string must include a timezone offset "
+                f"(got {value!r}). Example: '2026-05-15T12:00:00+00:00'."
+            )
+        return parsed.astimezone(UTC)
+    raise TypeError(f"Expected datetime or ISO string for {field}, got {type(value)!r}")
 
 
 def canonical_scope_json(scope: dict[str, str] | None = None) -> str:
@@ -60,7 +85,7 @@ class EvaluationKey(BaseModel):
     def _coerce_dt(cls, value: Any) -> Any:
         if value is None or value == "":
             return None
-        return parse_datetime(value)
+        return parse_datetime(value, field="EvaluationKey timestamp")
 
     @model_validator(mode="after")
     def _defaults(self) -> EvaluationKey:
@@ -77,16 +102,20 @@ class EvaluationKey(BaseModel):
     @property
     def window_id(self) -> str:
         if self.at is not None:
-            return ensure_utc(self.at).isoformat()
+            return require_aware(self.at).isoformat()
         assert self.start is not None and self.end is not None
-        return f"{ensure_utc(self.start).isoformat()}/{ensure_utc(self.end).isoformat()}"
+        return f"{require_aware(self.start).isoformat()}/{require_aware(self.end).isoformat()}"
 
     @property
     def eval_at(self) -> datetime:
         if self.at is not None:
-            return ensure_utc(self.at)
+            return require_aware(self.at)
         assert self.end is not None
-        return ensure_utc(self.end)
+        return require_aware(self.end)
+
+    @property
+    def identity(self) -> str:
+        return f"{self.metric}|{self.scope_key}|{self.window_id}"
 
     @classmethod
     def build(

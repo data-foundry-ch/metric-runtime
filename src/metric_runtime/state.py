@@ -9,12 +9,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING
 
-from metric_runtime.models import KPIState, KPIStatus, QualityReport
+from metric_runtime.models import (
+    KPIState,
+    KPIStateTransition,
+    KPIStatus,
+    QualityReport,
+    StoredObservation,
+)
 
 if TYPE_CHECKING:
     from metric_runtime.engine import KPIEngine
+
+# Re-export for public API stability.
+__all__ = [
+    "KPIStateTransition",
+    "StatePolicy",
+    "StateSignal",
+    "collect_window_history",
+    "evolve_state",
+    "observation_to_detection",
+]
 
 
 @dataclass
@@ -33,11 +49,17 @@ class StatePolicy:
             self.persistence = self.detections_before_open
 
 
-class KPIStateTransition(NamedTuple):
-    """Previous → current operational state for one process tick."""
+@dataclass(frozen=True)
+class StateSignal:
+    """One history step visible to state evolution.
 
-    previous: KPIState
-    current: KPIState
+    Ineligible (quality-failed) windows reset consecutive detection streaks
+    even though they are not treated as healthy normals.
+    """
+
+    detected: bool
+    eligible: bool
+    support_ok: bool = True
 
 
 def observation_to_detection(status: KPIStatus) -> KPIState:
@@ -47,28 +69,51 @@ def observation_to_detection(status: KPIStatus) -> KPIState:
     return KPIState.NORMAL
 
 
-def _trailing_detection_streak(history: list[KPIStatus]) -> int:
+def signals_from_history(history: list[StoredObservation]) -> list[StateSignal]:
+    """Convert stored observations into state-evolution signals."""
+    signals: list[StateSignal] = []
+    for item in history:
+        detected = bool(item.status.anomaly and item.status.support_ok)
+        signals.append(
+            StateSignal(
+                detected=detected and item.eligible_for_state,
+                eligible=item.eligible_for_state,
+                support_ok=item.status.support_ok,
+            )
+        )
+    return signals
+
+
+def _trailing_detection_streak(signals: list[StateSignal]) -> int:
+    """Count consecutive trailing *eligible* detections.
+
+    An ineligible window breaks the streak (does not bridge anomalies).
+    """
     streak = 0
-    for status in reversed(history):
-        if observation_to_detection(status) == KPIState.DETECTED:
-            streak += 1
-        else:
+    for signal in reversed(signals):
+        if not signal.eligible:
             break
+        if signal.detected:
+            streak += 1
+            continue
+        break
     return streak
 
 
-def _trailing_healthy_streak(history: list[KPIStatus]) -> int:
+def _trailing_healthy_streak(signals: list[StateSignal]) -> int:
     streak = 0
-    for status in reversed(history):
-        if observation_to_detection(status) == KPIState.NORMAL:
-            streak += 1
-        else:
+    for signal in reversed(signals):
+        if not signal.eligible:
             break
+        if not signal.detected:
+            streak += 1
+            continue
+        break
     return streak
 
 
 def evolve_state(
-    history: list[KPIStatus],
+    history: list[KPIStatus] | list[StateSignal] | list[StoredObservation],
     *,
     policy: StatePolicy | None = None,
     impact_eur: float = 0.0,
@@ -82,8 +127,7 @@ def evolve_state(
     - unhealthy quality → SUPPRESSED
     - enough healthy windows after OPEN/ACK → RESOLVED
     - ACKNOWLEDGED is sticky while the anomaly persists
-
-    Callers must pass only state-eligible observations in ``history``.
+    - ineligible (bad-quality) windows break consecutive detection streaks
     """
     policy = policy or StatePolicy()
     previous = previous or KPIState.NORMAL
@@ -91,11 +135,31 @@ def evolve_state(
     if quality is not None and not quality.healthy:
         return KPIState.SUPPRESSED
 
+    signals: list[StateSignal]
     if not history:
+        signals = []
+    elif isinstance(history[0], StateSignal):
+        signals = list(history)  # type: ignore[arg-type]
+    elif isinstance(history[0], StoredObservation):
+        signals = signals_from_history(history)  # type: ignore[arg-type]
+    else:
+        # Legacy: list[KPIStatus] assumed fully eligible.
+        statuses = [item for item in history if isinstance(item, KPIStatus)]
+        signals = [
+            StateSignal(
+                detected=observation_to_detection(status) == KPIState.DETECTED,
+                eligible=True,
+                support_ok=status.support_ok,
+            )
+            for status in statuses
+        ]
+
+    if not signals:
         return KPIState.NORMAL
 
-    healthy = _trailing_healthy_streak(history)
-    streak = _trailing_detection_streak(history)
+    healthy = _trailing_healthy_streak(signals)
+    streak = _trailing_detection_streak(signals)
+    last = signals[-1]
 
     if previous == KPIState.ACKNOWLEDGED and streak > 0:
         return KPIState.ACKNOWLEDGED
@@ -113,19 +177,21 @@ def evolve_state(
             return KPIState.DETECTED
         if impact_eur < policy.min_impact_eur:
             return KPIState.DETECTED
-        if policy.require_support and not history[-1].support_ok:
+        if policy.require_support and not last.support_ok:
             return KPIState.DETECTED
         return KPIState.OPEN
 
     if streak == 0:
         if previous == KPIState.RESOLVED:
             return KPIState.RESOLVED
+        if previous == KPIState.SUPPRESSED and not last.eligible:
+            return KPIState.SUPPRESSED
         return KPIState.NORMAL
     if streak < policy.persistence:
         return KPIState.DETECTED
     if impact_eur < policy.min_impact_eur:
         return KPIState.DETECTED
-    if policy.require_support and not history[-1].support_ok:
+    if policy.require_support and not last.support_ok:
         return KPIState.DETECTED
     return KPIState.OPEN
 

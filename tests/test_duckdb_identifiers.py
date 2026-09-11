@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import duckdb
 import pytest
@@ -47,7 +47,7 @@ def test_executor_rejects_bad_measure_in_query():
     con.execute("CREATE TABLE fact_orders (ts TIMESTAMP, orders DOUBLE, city VARCHAR)")
     con.execute(
         "INSERT INTO fact_orders VALUES (?, 10, 'Amsterdam')",
-        [datetime(2026, 5, 15, 12, 0)],
+        [datetime(2026, 5, 15, 12, 0, tzinfo=UTC)],
     )
     executor = DuckDBExecutor(con, fact_table="fact_orders")
     with pytest.raises(ValueError, match="Invalid"):
@@ -63,6 +63,6 @@ def test_executor_rejects_bad_filter_column():
     with pytest.raises(ValueError, match="Invalid"):
         executor.metric_value(
             Formula.sum("orders"),
-            at=datetime(2026, 5, 15, 12, 0),
+            at=datetime(2026, 5, 15, 12, 0, tzinfo=UTC),
             filters={"city; DROP TABLE fact_orders--": "Amsterdam"},
         )

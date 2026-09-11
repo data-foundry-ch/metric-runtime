@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from metric_runtime.engine import KPIEngine
 from metric_runtime.models import QualityReport
@@ -17,6 +17,10 @@ def check_data_quality(
     max_missing_rate: float = 0.02,
 ) -> QualityReport:
     """Lightweight warehouse health gate before business incidents may open."""
+    if at.tzinfo is None:
+        raise ValueError("at must be timezone-aware")
+    at_utc = at.astimezone(UTC)
+
     if engine.con is None:
         return QualityReport(
             healthy=False,
@@ -43,8 +47,12 @@ def check_data_quality(
         )
 
     latest_ts = latest if isinstance(latest, datetime) else datetime.fromisoformat(str(latest))
-    lag = at - latest_ts if at >= latest_ts else timedelta(0)
-    freshness_ok = lag <= timedelta(hours=max_lag_hours) or latest_ts >= at
+    if latest_ts.tzinfo is None:
+        latest_ts = latest_ts.replace(tzinfo=UTC)
+    else:
+        latest_ts = latest_ts.astimezone(UTC)
+    lag = at_utc - latest_ts if at_utc >= latest_ts else timedelta(0)
+    freshness_ok = lag <= timedelta(hours=max_lag_hours) or latest_ts >= at_utc
 
     row = engine.con.execute(
         f"""
@@ -54,7 +62,7 @@ def check_data_quality(
         FROM {engine.fact_table}
         WHERE ts = ?
         """,
-        [at],
+        [at_utc.replace(tzinfo=None)],
     ).fetchone()
     row_count = int(row[0] or 0)
     missing_rate = float(row[1] or 0.0)

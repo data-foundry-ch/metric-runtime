@@ -12,14 +12,20 @@ from pathlib import Path
 from metric_runtime.catalog import KPICatalog
 from metric_runtime.detectors import DetectorStrategy, SeasonalZScoreDetector
 from metric_runtime.detectors.specs import build_detector
-from metric_runtime.exceptions import MetricRuntimeError, UnknownMetricError
+from metric_runtime.exceptions import (
+    EvaluationInProgressError,
+    MetricRuntimeError,
+    UnknownMetricError,
+)
 from metric_runtime.identity import EvaluationKey, ensure_utc
 from metric_runtime.models import (
     KPI,
     DetectorConfig,
     DrilldownRow,
+    EvaluationRecord,
     IncidentState,
     KPIState,
+    KPIStateTransition,
     KPIStatus,
     MeasureRef,
     MetricStateRecord,
@@ -29,7 +35,8 @@ from metric_runtime.models import (
     StoredObservation,
 )
 from metric_runtime.notifications.base import Notifier, NullNotifier
-from metric_runtime.state import KPIStateTransition, StatePolicy, evolve_state
+from metric_runtime.state import StatePolicy, evolve_state, signals_from_history
+from metric_runtime.stores.base import EvaluationClaimStatus
 from metric_runtime.stores.memory import InMemoryStateStore
 
 
@@ -201,6 +208,7 @@ class KPIEngine:
         at: datetime,
         filters: dict[str, str] | None = None,
     ) -> KPIStatus:
+        at = ensure_utc(at)
         metric = self._get_kpi(metric_name)
         strategy, cfg = _resolve_detector(metric, self.detector)
         current = self.metric_value(metric_name, at, filters)
@@ -230,6 +238,8 @@ class KPIEngine:
         baseline_weeks: int | None = None,
     ) -> KPIStatus:
         """Compare a multi-interval window to same windows in prior weeks."""
+        start = ensure_utc(start)
+        end = ensure_utc(end)
         metric = self._get_kpi(metric_name)
         strategy, cfg = _resolve_detector(metric, self.detector)
         weeks = baseline_weeks if baseline_weeks is not None else cfg.baseline_weeks
@@ -365,7 +375,6 @@ class KPIEngine:
         at: datetime | None = None,
     ) -> KPIState:
         """Explicit human acknowledgement — sticky while the anomaly persists."""
-
         from metric_runtime.identity import canonical_scope_key
 
         scope = dict(scope or {})
@@ -378,11 +387,15 @@ class KPIEngine:
                 scope_key=scope_key,
                 scope=scope,
                 state=KPIState.ACKNOWLEDGED,
-                state_since=stamp
-                if previous.state != KPIState.ACKNOWLEDGED
-                else previous.state_since,
+                state_since=(
+                    stamp if previous.state != KPIState.ACKNOWLEDGED else previous.state_since
+                ),
                 updated_at=stamp,
+                opened_at=previous.opened_at,
+                acknowledged_at=stamp,
                 resolved_at=previous.resolved_at,
+                detection_streak=previous.detection_streak,
+                healthy_streak=previous.healthy_streak,
             )
         )
         active = self.state_store.find_active_incident(metric, scope_key)
@@ -394,20 +407,69 @@ class KPIEngine:
         return KPIState.ACKNOWLEDGED
 
     def deliver_notifications(self, *, limit: int | None = None) -> list[OutboxEvent]:
-        """Delivery worker: send pending outbox events through the notifier."""
+        """Delivery worker: send pending outbox events through the notifier.
 
+        External delivery is at-least-once. Failures are recorded on the event
+        and do not block later events. Returns events successfully marked delivered
+        in this pass.
+        """
         pending = self.state_store.list_pending_notifications()
         if limit is not None:
             pending = pending[:limit]
         delivered: list[OutboxEvent] = []
         for event in pending:
-            if event.incident is not None:
-                self.notifier.notify(event.incident)
+            now = datetime.now(UTC)
+            try:
+                if event.incident is not None:
+                    self.notifier.notify(
+                        event.incident,
+                        idempotency_key=event.event_key or event.id,
+                    )
+            except Exception as exc:  # noqa: BLE001 - record and continue
+                assert event.id is not None
+                self.state_store.record_notification_attempt(
+                    event.id,
+                    at=now,
+                    error=str(exc)[:500],
+                )
+                continue
             assert event.id is not None
-            delivered.append(
-                self.state_store.mark_notification_delivered(event.id, at=datetime.now(UTC))
-            )
+            delivered.append(self.state_store.mark_notification_delivered(event.id, at=now))
         return delivered
+
+    def _result_from_record(self, record: EvaluationRecord) -> ProcessResult:
+        """Reconstruct an idempotent ProcessResult from a committed record."""
+        return ProcessResult(
+            metric=record.key.metric,
+            scope=dict(record.key.scope),
+            evaluation_key=record.key,
+            at=record.key.eval_at,
+            status=record.status,
+            transition=record.transition,
+            new_incidents=[],
+            updated_incidents=[],
+            notifications=[],
+            investigation=record.investigation,
+            idempotent=True,
+            evaluation_record=record,
+        )
+
+    @staticmethod
+    def _outbox_event_key(
+        *,
+        kind: str,
+        metric: str,
+        incident_id: str | None,
+        previous: KPIState,
+        current: KPIState,
+        eval_identity: str,
+    ) -> str:
+        import hashlib
+
+        raw = (
+            f"{kind}|{metric}|{incident_id or ''}|{previous.value}|{current.value}|{eval_identity}"
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def process(
         self,
@@ -421,14 +483,15 @@ class KPIEngine:
         preferred_leaves: tuple[str, ...] = (),
         context: list[str] | None = None,
     ) -> ProcessResult:
-        """Authoritative runtime tick: observe → persist → state → incident → outbox.
+        """Authoritative runtime tick with atomic commit semantics.
 
-        True idempotency: EvaluationKey is computed first; a stored observation
-        short-circuits before warehouse evaluation. Notifications are enqueued
-        to an outbox (call ``deliver_notifications`` to send).
+        Calculate once. Commit once. Act from committed state.
         """
-
         from metric_runtime.incidents import incident_from_investigation
+        from metric_runtime.state import (
+            _trailing_detection_streak,
+            _trailing_healthy_streak,
+        )
 
         scope = dict(scope or {})
         leaves = preferred_leaves or self.preferred_leaves
@@ -437,214 +500,302 @@ class KPIEngine:
         scope_key = eval_key.scope_key
         eval_at = eval_key.eval_at
 
-        existing = self.state_store.get_observation(eval_key)
-        if existing is not None:
-            record = self.state_store.get_state_record(metric, scope_key)
-            return ProcessResult(
-                metric=metric,
-                scope=scope,
-                evaluation_key=eval_key,
-                at=eval_at,
-                status=existing.status,
-                transition=KPIStateTransition(record.state, record.state),
-                idempotent=True,
+        claim = self.state_store.claim_evaluation(eval_key)
+        if claim.status == EvaluationClaimStatus.ALREADY_COMMITTED:
+            assert claim.record is not None
+            return self._result_from_record(claim.record)
+        if claim.status == EvaluationClaimStatus.IN_PROGRESS:
+            raise EvaluationInProgressError(
+                f"Evaluation already in progress for {eval_key.identity}"
             )
 
-        if start is not None and end is not None:
-            status = self.evaluate_window(metric, start, end, scope)
-        else:
-            assert at is not None
-            status = self.evaluate(metric, at, scope)
+        try:
+            if start is not None and end is not None:
+                status = self.evaluate_window(metric, start, end, scope)
+            else:
+                assert at is not None
+                status = self.evaluate(metric, at, scope)
 
-        quality_ok = True if quality is None else quality.healthy
-        eligible = quality_ok
-        stored_obs = self.state_store.put_observation(
-            StoredObservation(
+            quality_ok = True if quality is None else quality.healthy
+            now = datetime.now(UTC)
+            observation = StoredObservation(
                 key=eval_key,
                 status=status,
-                eligible_for_state=eligible,
+                eligible_for_state=quality_ok,
                 quality_healthy=None if quality is None else quality.healthy,
-                recorded_at=datetime.now(UTC),
+                recorded_at=now,
             )
-        )
 
-        previous_record = self.state_store.get_state_record(metric, scope_key)
-        previous = previous_record.state
-        eligible_history = [
-            item.status
-            for item in self.state_store.get_history(metric, scope_key)
-            if item.eligible_for_state
-        ]
-        impact = self.estimate_impact_eur(
-            metric, eval_at, status.value, status.baseline_mean, scope
-        )
+            previous_record = self.state_store.get_state_record(metric, scope_key)
+            previous = previous_record.state
+            history = list(self.state_store.get_history(metric, scope_key)) + [observation]
+            signals = signals_from_history(history)
+            impact = self.estimate_impact_eur(
+                metric, eval_at, status.value, status.baseline_mean, scope
+            )
+            current = evolve_state(
+                signals,
+                policy=policy,
+                impact_eur=impact,
+                quality=quality,
+                previous=previous,
+            )
+            if previous == KPIState.RESOLVED and current in {
+                KPIState.DETECTED,
+                KPIState.OPEN,
+            }:
+                if previous_record.resolved_at is not None:
+                    delta = eval_at - ensure_utc(previous_record.resolved_at)
+                    if delta < timedelta(minutes=policy.cooldown_minutes):
+                        current = KPIState.RESOLVED
 
-        current = evolve_state(
-            eligible_history,
-            policy=policy,
-            impact_eur=impact,
-            quality=quality,
-            previous=previous,
-        )
-
-        if previous == KPIState.RESOLVED and current in {KPIState.DETECTED, KPIState.OPEN}:
-            if previous_record.resolved_at is not None:
-                delta = eval_at - ensure_utc(previous_record.resolved_at)
-                if delta < timedelta(minutes=policy.cooldown_minutes):
-                    current = KPIState.RESOLVED
-
-        now = datetime.now(UTC)
-        resolved_at = previous_record.resolved_at
-        state_since = previous_record.state_since
-        if previous != current:
-            state_since = now
-        if current == KPIState.RESOLVED:
-            resolved_at = eval_at
-        self.state_store.set_state_record(
-            MetricStateRecord(
+            detection_streak = _trailing_detection_streak(signals)
+            healthy_streak = _trailing_healthy_streak(signals)
+            resolved_at = previous_record.resolved_at
+            opened_at = previous_record.opened_at
+            acknowledged_at = previous_record.acknowledged_at
+            state_since = previous_record.state_since
+            if previous != current:
+                state_since = now
+            if current == KPIState.RESOLVED:
+                resolved_at = eval_at
+            if current == KPIState.OPEN:
+                opened_at = opened_at or eval_at
+            if current == KPIState.ACKNOWLEDGED:
+                acknowledged_at = acknowledged_at or eval_at
+            state_record = MetricStateRecord(
                 metric=metric,
                 scope_key=scope_key,
                 scope=scope,
                 state=current,
                 state_since=state_since,
                 updated_at=now,
+                opened_at=opened_at,
+                acknowledged_at=acknowledged_at,
                 resolved_at=resolved_at,
+                detection_streak=detection_streak,
+                healthy_streak=healthy_streak,
             )
-        )
+            transition = KPIStateTransition(previous=previous, current=current)
 
-        transition = KPIStateTransition(previous, current)
-        new_incidents: list = []
-        updated_incidents: list = []
-        notifications: list[OutboxEvent] = []
-        investigation = None
-        active = self.state_store.find_active_incident(metric, scope_key)
+            investigation = None
+            draft_incident = None
+            merge_active = None
+            outbox_drafts: list[OutboxEvent] = []
+            active = self.state_store.find_active_incident(metric, scope_key)
 
-        def _enqueue(event: OutboxEvent) -> OutboxEvent:
-            queued = self.state_store.enqueue_notification(event)
-            notifications.append(queued)
-            return queued
-
-        if current == KPIState.OPEN:
-            investigation = self.investigate(
-                metric, at=eval_at, filters=scope, preferred_leaves=leaves
-            )
-            first_detected = (
-                active.first_detected
-                if active is not None
-                else next(
-                    (h.as_of for h in eligible_history if h.anomaly and h.support_ok),
-                    status.as_of,
+            if current == KPIState.OPEN:
+                investigation = self.investigate(
+                    metric, at=eval_at, filters=scope, preferred_leaves=leaves
                 )
-            )
-            draft = incident_from_investigation(
-                self,
-                center_kpi=metric,
-                scope=scope,
-                at=eval_at,
-                inv=investigation,
-                state=IncidentState.OPEN,
-                first_detected=first_detected,
-                estimated_impact=impact,
-                persistence_windows=policy.persistence,
-                context=context,
-                preferred_leaves=leaves,
-            )
-            if active is None:
-                stored = self.state_store.upsert_incident(draft)
-                new_incidents.append(stored)
-                _enqueue(
-                    OutboxEvent(
-                        kind="incident_opened",
-                        incident=stored,
-                        metric=metric,
-                        previous_state=previous,
-                        current_state=current,
-                        message=f"Opened incident for {metric}",
-                        created_at=now,
+                first_detected = (
+                    active.first_detected
+                    if active is not None
+                    else next(
+                        (
+                            item.status.as_of
+                            for item in history
+                            if item.eligible_for_state
+                            and item.status.anomaly
+                            and item.status.support_ok
+                        ),
+                        status.as_of,
                     )
                 )
-            else:
-                merged = draft.model_copy(
-                    update={
-                        "id": active.id,
-                        "first_detected": active.first_detected,
-                        "opened_at": active.opened_at or draft.opened_at,
-                        "state": IncidentState.OPEN,
-                    }
+                draft_incident = incident_from_investigation(
+                    self,
+                    center_kpi=metric,
+                    scope=scope,
+                    at=eval_at,
+                    inv=investigation,
+                    state=IncidentState.OPEN,
+                    first_detected=first_detected,
+                    estimated_impact=impact,
+                    persistence_windows=policy.persistence,
+                    context=context,
+                    preferred_leaves=leaves,
                 )
-                meaningful = (
-                    previous != current
-                    or active.explanatory_kpi != merged.explanatory_kpi
-                    or active.owner != merged.owner
-                    or active.state != IncidentState.OPEN
+                merge_active = active
+
+            elif current == KPIState.RESOLVED and active is not None:
+                draft_incident = active.model_copy(
+                    update={"state": IncidentState.RESOLVED, "updated_at": eval_at}
                 )
-                stored = self.state_store.upsert_incident(merged)
-                updated_incidents.append(stored)
-                if meaningful:
-                    _enqueue(
+                merge_active = active
+
+            elif current == KPIState.SUPPRESSED and previous != current and active is not None:
+                draft_incident = active.model_copy(
+                    update={"state": IncidentState.SUPPRESSED, "updated_at": eval_at}
+                )
+                merge_active = active
+
+            with self.state_store.transaction() as tx:
+                tx.stage_observation(observation)
+                tx.stage_state_record(state_record)
+
+                new_incident_ids: list[str] = []
+                updated_incident_ids: list[str] = []
+                staged_incidents: list = []
+
+                if current == KPIState.OPEN and draft_incident is not None:
+                    if merge_active is None:
+                        stored = tx.stage_incident(draft_incident)
+                        staged_incidents.append(stored)
+                        new_incident_ids.append(stored.id)  # type: ignore[arg-type]
+                        outbox_drafts.append(
+                            OutboxEvent(
+                                event_key=self._outbox_event_key(
+                                    kind="incident_opened",
+                                    metric=metric,
+                                    incident_id=stored.id,
+                                    previous=previous,
+                                    current=current,
+                                    eval_identity=eval_key.identity,
+                                ),
+                                kind="incident_opened",
+                                incident_id=stored.id,
+                                incident=stored,
+                                metric=metric,
+                                previous_state=previous,
+                                current_state=current,
+                                message=f"Opened incident for {metric}",
+                                created_at=now,
+                            )
+                        )
+                    else:
+                        meaningful = (
+                            previous != current
+                            or merge_active.explanatory_kpi != draft_incident.explanatory_kpi
+                            or merge_active.owner != draft_incident.owner
+                            or merge_active.state != IncidentState.OPEN
+                        )
+                        merged = draft_incident.model_copy(
+                            update={
+                                "id": merge_active.id,
+                                "first_detected": merge_active.first_detected,
+                                "opened_at": merge_active.opened_at or draft_incident.opened_at,
+                                "state": IncidentState.OPEN,
+                            }
+                        )
+                        stored = tx.stage_incident(merged)
+                        staged_incidents.append(stored)
+                        updated_incident_ids.append(stored.id)  # type: ignore[arg-type]
+                        if meaningful:
+                            outbox_drafts.append(
+                                OutboxEvent(
+                                    event_key=self._outbox_event_key(
+                                        kind="incident_updated",
+                                        metric=metric,
+                                        incident_id=stored.id,
+                                        previous=previous,
+                                        current=current,
+                                        eval_identity=eval_key.identity,
+                                    ),
+                                    kind="incident_updated",
+                                    incident_id=stored.id,
+                                    incident=stored,
+                                    metric=metric,
+                                    previous_state=previous,
+                                    current_state=current,
+                                    message=f"Updated incident for {metric}",
+                                    created_at=now,
+                                )
+                            )
+
+                elif current == KPIState.RESOLVED and draft_incident is not None:
+                    stored = tx.stage_incident(draft_incident)
+                    staged_incidents.append(stored)
+                    updated_incident_ids.append(stored.id)  # type: ignore[arg-type]
+                    if previous != current:
+                        outbox_drafts.append(
+                            OutboxEvent(
+                                event_key=self._outbox_event_key(
+                                    kind="incident_resolved",
+                                    metric=metric,
+                                    incident_id=stored.id,
+                                    previous=previous,
+                                    current=current,
+                                    eval_identity=eval_key.identity,
+                                ),
+                                kind="incident_resolved",
+                                incident_id=stored.id,
+                                incident=stored,
+                                metric=metric,
+                                previous_state=previous,
+                                current_state=current,
+                                message=f"Resolved incident for {metric}",
+                                created_at=now,
+                            )
+                        )
+
+                elif current == KPIState.SUPPRESSED and previous != current:
+                    outbox_drafts.append(
                         OutboxEvent(
-                            kind="incident_updated",
-                            incident=stored,
+                            event_key=self._outbox_event_key(
+                                kind="state_changed",
+                                metric=metric,
+                                incident_id=(draft_incident.id if draft_incident else None),
+                                previous=previous,
+                                current=current,
+                                eval_identity=eval_key.identity,
+                            ),
+                            kind="state_changed",
+                            incident_id=(draft_incident.id if draft_incident else None),
+                            incident=draft_incident,
                             metric=metric,
                             previous_state=previous,
                             current_state=current,
-                            message=f"Updated incident for {metric}",
+                            message=f"Suppressed {metric} due to data quality",
                             created_at=now,
                         )
                     )
+                    if draft_incident is not None:
+                        stored = tx.stage_incident(draft_incident)
+                        staged_incidents.append(stored)
+                        updated_incident_ids.append(stored.id)  # type: ignore[arg-type]
 
-        elif current == KPIState.RESOLVED and active is not None:
-            resolved = active.model_copy(
-                update={"state": IncidentState.RESOLVED, "updated_at": eval_at}
+                notifications = [tx.stage_notification(ev) for ev in outbox_drafts]
+                incident_ids = [i.id for i in staged_incidents if i.id is not None]
+                record = EvaluationRecord(
+                    key=eval_key,
+                    observation=observation,
+                    transition=transition,
+                    status=status,
+                    state_record=state_record,
+                    incident_ids=incident_ids,
+                    outbox_event_ids=[e.id for e in notifications if e.id],
+                    new_incident_ids=new_incident_ids,
+                    updated_incident_ids=updated_incident_ids,
+                    investigation=investigation,
+                    committed_at=now,
+                )
+                tx.stage_evaluation_record(record)
+                tx.commit()
+
+            return ProcessResult(
+                metric=metric,
+                scope=scope,
+                evaluation_key=eval_key,
+                at=eval_at,
+                status=status,
+                transition=transition,
+                new_incidents=[
+                    i
+                    for iid in new_incident_ids
+                    if (i := self.state_store.get_incident(iid)) is not None
+                ],
+                updated_incidents=[
+                    i
+                    for iid in updated_incident_ids
+                    if (i := self.state_store.get_incident(iid)) is not None
+                ],
+                notifications=notifications,
+                investigation=investigation,
+                idempotent=False,
+                evaluation_record=record,
             )
-            stored = self.state_store.upsert_incident(resolved)
-            updated_incidents.append(stored)
-            if previous != current:
-                _enqueue(
-                    OutboxEvent(
-                        kind="incident_resolved",
-                        incident=stored,
-                        metric=metric,
-                        previous_state=previous,
-                        current_state=current,
-                        message=f"Resolved incident for {metric}",
-                        created_at=now,
-                    )
-                )
-
-        elif current == KPIState.SUPPRESSED and previous != current:
-            _enqueue(
-                OutboxEvent(
-                    kind="state_changed",
-                    metric=metric,
-                    previous_state=previous,
-                    current_state=current,
-                    message=f"Suppressed {metric} due to data quality",
-                    created_at=now,
-                )
-            )
-            if active is not None:
-                suppressed = active.model_copy(
-                    update={"state": IncidentState.SUPPRESSED, "updated_at": eval_at}
-                )
-                stored = self.state_store.upsert_incident(suppressed)
-                updated_incidents.append(stored)
-
-        _ = stored_obs  # persisted before side effects
-
-        return ProcessResult(
-            metric=metric,
-            scope=scope,
-            evaluation_key=eval_key,
-            at=eval_at,
-            status=status,
-            transition=transition,
-            new_incidents=new_incidents,
-            updated_incidents=updated_incidents,
-            notifications=notifications,
-            investigation=investigation,
-            idempotent=False,
-        )
+        finally:
+            self.state_store.release_evaluation_claim(eval_key, token=claim.token)
 
     # Alias used by schedulers / workers.
     tick = process

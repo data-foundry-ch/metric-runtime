@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from metric_runtime import KPI, Formula, InMemoryStateStore, KPICatalog, KPIEngine
 from metric_runtime.exceptions import MetricRuntimeError
+from metric_runtime.identity import NaiveDatetimeError
 
 
 def test_engine_python_api_without_yaml():
@@ -20,7 +21,7 @@ def test_engine_python_api_without_yaml():
     try:
         engine.evaluate("requests", __import__("datetime").datetime(2026, 1, 1))
         raised = False
-    except MetricRuntimeError:
+    except (MetricRuntimeError, NaiveDatetimeError):
         raised = True
     assert raised
 

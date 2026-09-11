@@ -5,16 +5,16 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
-    ConfigDict,
     Field,
     field_validator,
     model_validator,
 )
 
+from metric_runtime.detectors.policy import SeasonalZScore, Threshold
 from metric_runtime.identity import EvaluationKey, parse_datetime
 
 _MEASURE_REF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -159,9 +159,7 @@ class ImpactModel(BaseModel):
         return value
 
 
-def _default_detector_spec() -> Any:
-    from metric_runtime.detectors.specs import SeasonalZScore
-
+def _default_detector_spec() -> SeasonalZScore:
     return SeasonalZScore()
 
 
@@ -183,7 +181,9 @@ class KPI(BaseModel):
     dimensions: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
     directionality: Directionality = Directionality.TWO_SIDED
-    detector: Any = Field(default_factory=_default_detector_spec)
+    detector: Annotated[SeasonalZScore | Threshold, Field(discriminator="type")] = Field(
+        default_factory=_default_detector_spec
+    )
     support: SupportRequirement | None = None
     impact: ImpactModel = Field(default_factory=ImpactModel)
     unit: Literal["count", "ratio", "eur", "percent", "unit"] = "unit"
@@ -192,7 +192,7 @@ class KPI(BaseModel):
     @field_validator("detector", mode="before")
     @classmethod
     def _coerce_detector(cls, value: Any) -> Any:
-        from metric_runtime.detectors.specs import coerce_detector_spec
+        from metric_runtime.detectors.policy import coerce_detector_spec
 
         return coerce_detector_spec(value)
 
@@ -325,14 +325,43 @@ class MetricStateRecord(BaseModel):
     state: KPIState = KPIState.NORMAL
     state_since: datetime
     updated_at: datetime
+    opened_at: datetime | None = None
+    acknowledged_at: datetime | None = None
     resolved_at: datetime | None = None
+    detection_streak: int = 0
+    healthy_streak: int = 0
 
-    @field_validator("state_since", "updated_at", "resolved_at", mode="before")
+    @field_validator(
+        "state_since",
+        "updated_at",
+        "opened_at",
+        "acknowledged_at",
+        "resolved_at",
+        mode="before",
+    )
     @classmethod
     def _coerce_dt(cls, value: Any) -> Any:
         if value is None or value == "":
             return None
         return parse_datetime(value)
+
+
+class KPIStateTransition(BaseModel):
+    """Previous → current operational state for one committed evaluation."""
+
+    previous: KPIState
+    current: KPIState
+
+    def __iter__(self):
+        yield self.previous
+        yield self.current
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, KPIStateTransition):
+            return self.previous == other.previous and self.current == other.current
+        if isinstance(other, tuple) and len(other) == 2:
+            return self.previous == other[0] and self.current == other[1]
+        return NotImplemented
 
 
 class DrilldownRow(BaseModel):
@@ -447,19 +476,36 @@ class Incident(BaseModel):
 
 
 class OutboxEvent(BaseModel):
-    """Durable notification intent — persist before delivery."""
+    """Durable notification intent — persist before delivery.
+
+    Runtime commits create at most one outbox intent per meaningful transition
+    (``event_key``). External delivery is at-least-once unless the notifier
+    honors ``event_key`` as an idempotency key.
+    """
 
     id: str | None = None
+    event_key: str = ""
     kind: Literal["incident_opened", "incident_updated", "incident_resolved", "state_changed"]
     metric: str = ""
+    incident_id: str | None = None
     incident: Incident | None = None
     previous_state: KPIState | None = None
     current_state: KPIState | None = None
     message: str = ""
     created_at: datetime
     delivered_at: datetime | None = None
+    attempt_count: int = 0
+    last_attempt_at: datetime | None = None
+    last_error: str | None = None
+    next_attempt_at: datetime | None = None
 
-    @field_validator("created_at", "delivered_at", mode="before")
+    @field_validator(
+        "created_at",
+        "delivered_at",
+        "last_attempt_at",
+        "next_attempt_at",
+        mode="before",
+    )
     @classmethod
     def _coerce_dt(cls, value: Any) -> Any:
         if value is None or value == "":
@@ -475,6 +521,27 @@ class OutboxEvent(BaseModel):
 NotificationEvent = OutboxEvent
 
 
+class EvaluationRecord(BaseModel):
+    """Authoritative committed result for one EvaluationKey."""
+
+    key: EvaluationKey
+    observation: StoredObservation
+    transition: KPIStateTransition
+    status: KPIStatus
+    state_record: MetricStateRecord
+    incident_ids: list[str] = Field(default_factory=list)
+    outbox_event_ids: list[str] = Field(default_factory=list)
+    new_incident_ids: list[str] = Field(default_factory=list)
+    updated_incident_ids: list[str] = Field(default_factory=list)
+    investigation: InvestigationResult | None = None
+    committed_at: datetime
+
+    @field_validator("committed_at", mode="before")
+    @classmethod
+    def _coerce_committed_at(cls, value: Any) -> datetime:
+        return parse_datetime(value)
+
+
 class ProcessResult(BaseModel):
     """Outcome of one authoritative runtime tick."""
 
@@ -483,14 +550,13 @@ class ProcessResult(BaseModel):
     evaluation_key: EvaluationKey | None = None
     at: datetime
     status: KPIStatus
-    transition: Any  # KPIStateTransition NamedTuple (previous, current)
+    transition: KPIStateTransition
     new_incidents: list[Incident] = Field(default_factory=list)
     updated_incidents: list[Incident] = Field(default_factory=list)
     notifications: list[OutboxEvent] = Field(default_factory=list)
     investigation: InvestigationResult | None = None
     idempotent: bool = False
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    evaluation_record: EvaluationRecord | None = None
 
     @field_validator("at", mode="before")
     @classmethod

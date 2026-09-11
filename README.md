@@ -98,13 +98,16 @@ Business semantics become software.
 The authoritative loop is ``KPIEngine.process`` (alias ``tick``):
 
 ```python
+from datetime import UTC, datetime
+
 result = engine.process(
     metric="profit_margin",
-    at=timestamp,
+    at=datetime(2026, 5, 15, 12, 0, tzinfo=UTC),
     scope={"city": "Amsterdam"},
 )
 # result.transition == (previous_state, current_state)
 # result.new_incidents / result.notifications only on meaningful changes
+# retries with the same EvaluationKey return the committed result
 ```
 
 ## Quick start

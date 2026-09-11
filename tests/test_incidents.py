@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from metric_runtime.models import Incident, IncidentState
 
 
@@ -13,7 +15,7 @@ def test_incident_fields():
         scope={"city": "Amsterdam"},
         owner="Commercial Growth / Promotions",
         state=IncidentState.OPEN,
-        first_detected="2026-05-15 12:00:00",
+        first_detected=datetime(2026, 5, 15, 12, 0, tzinfo=UTC),
         estimated_impact=250.0,
         suppressed_ancestors=["weekend_profit", "profit_margin"],
     )
