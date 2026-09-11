@@ -50,3 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - External notification delivery is explicitly at-least-once; notifiers receive ``idempotency_key``
 - Preferred-leaf hints are a weak tie-breaker only in investigation ranking
 - ``ProcessResult.transition`` is a typed ``KPIStateTransition`` (no ``arbitrary_types_allowed``)
+- Ordered metric-state processing per ``(metric, scope)`` via stream lease + ``last_evaluation_at`` / ``version``
+- ``StaleEvaluationError`` when an older window would overwrite newer state
+- Outbox ``state_changed`` only when an incident payload exists (notifier contract)
+- Deprecated legacy store helpers: ``append_observation``, ``has_observation``, ``set_state``

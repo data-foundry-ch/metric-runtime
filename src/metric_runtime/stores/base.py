@@ -6,6 +6,9 @@ Runtime stores: what metric-runtime currently believes / has already acted upon.
 Observation, state, incidents, and notification outbox have different retention
 and concurrency characteristics. Transactional commit makes one EvaluationKey's
 mutations atomic from the runtime's perspective.
+
+Per-(metric, scope) streams additionally enforce monotonic ``effective_at``
+ordering so a newer window cannot be overwritten by an older one.
 """
 
 from __future__ import annotations
@@ -19,8 +22,6 @@ from metric_runtime.identity import EvaluationKey, canonical_scope_key
 from metric_runtime.models import (
     EvaluationRecord,
     Incident,
-    KPIState,
-    KPIStatus,
     MetricStateRecord,
     OutboxEvent,
     StoredObservation,
@@ -75,20 +76,12 @@ class ObservationStore(Protocol):
 
     def get_history(self, metric: str, scope_key: str = "") -> list[StoredObservation]: ...
 
-    def append_observation(self, metric: str, status: KPIStatus, scope_key: str = "") -> None: ...
-
-    def has_observation(self, metric: str, as_of: str, scope_key: str = "") -> bool: ...
-
 
 @runtime_checkable
 class MetricStateStore(Protocol):
     def get_state_record(self, metric: str, scope_key: str = "") -> MetricStateRecord: ...
 
     def set_state_record(self, record: MetricStateRecord) -> None: ...
-
-    def get_state(self, metric: str, scope_key: str = "") -> KPIState: ...
-
-    def set_state(self, metric: str, state: KPIState, scope_key: str = "") -> None: ...
 
 
 @runtime_checkable
@@ -163,6 +156,15 @@ class TransactionalRuntimeStore(Protocol):
     def release_evaluation_claim(self, key: EvaluationKey, *, token: str | None = None) -> None: ...
 
     def get_committed_result(self, key: EvaluationKey) -> EvaluationRecord | None: ...
+
+    def ordered_stream_commit(
+        self,
+        key: EvaluationKey,
+        *,
+        timeout: float | None = 30.0,
+    ) -> AbstractContextManager[None]:
+        """Wait until this evaluation is next for its (metric, scope) stream."""
+        ...
 
 
 @runtime_checkable
