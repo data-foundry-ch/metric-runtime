@@ -58,6 +58,9 @@ def test_kpi_model_json_schema():
     assert "name" in schema["properties"]
     assert "detector" in schema["properties"]
     assert "formula" in schema["properties"]
+    assert "label" in schema["properties"]
+    assert "unit" in schema["properties"]
+    assert "format" in schema["properties"]
     # Presentation layout is not a first-class KPI field.
     assert "graph_ring" not in schema["properties"]
     assert "graph_side" not in schema["properties"]

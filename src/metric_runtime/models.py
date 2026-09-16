@@ -169,8 +169,9 @@ class KPI(BaseModel):
     A KPI says what the metric means. The runtime profile says where it
     is evaluated. ``calculation`` defines how the value is obtained.
 
-    Presentation / layout hints belong in ``metadata`` (or the example
-    layer), not as first-class core fields.
+    Display fields for embedders: ``label``, ``unit``, ``format``.
+    Layout hints (parent / ring / order) belong in ``metadata`` (or the
+    product layer), not as first-class core fields.
     """
 
     name: str
@@ -191,6 +192,10 @@ class KPI(BaseModel):
     support: SupportRequirement | None = None
     impact: ImpactModel = Field(default_factory=ImpactModel)
     unit: Literal["count", "ratio", "eur", "percent", "unit"] = "unit"
+    format: str | None = Field(
+        default=None,
+        description="Optional display format hint for embedders (e.g. '0.0%', '#,##0').",
+    )
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("detector", mode="before")
@@ -228,8 +233,20 @@ class KPI(BaseModel):
     def display_name(self) -> str:
         return self.label or self.name
 
+    def display(self) -> dict[str, Any]:
+        """Product display hints: label / unit / format (not layout)."""
+        return {
+            "label": self.display_name,
+            "unit": self.unit,
+            "format": self.format,
+        }
+
     def presentation(self) -> dict[str, Any]:
-        """Optional example/presentation hints stored under metadata."""
+        """Optional layout/example hints stored under metadata['presentation'].
+
+        Prefer ``display()`` for unit/label/format. Keep graph parent/ring/order
+        in metadata — not first-class core fields.
+        """
         raw = self.metadata.get("presentation")
         return dict(raw) if isinstance(raw, dict) else {}
 
@@ -244,9 +261,17 @@ class KPIObservation(BaseModel):
     Detection asks whether something is unusual.
     An observation alone is not an alert.
 
-    ``value_status`` distinguishes a numeric VALUE from NO_DATA / ERROR.
-    When status is not VALUE, ``value`` is a placeholder (0.0) and must not be
-    treated as a measured zero unless the KPI explicitly says so.
+    Null semantics for embedders / UI bridges:
+
+    - ``value_status == "value"``: ``value`` is a real measurement (including
+      legitimate ``0.0``). Use ``measured_value`` / ``has_value``.
+    - ``value_status == "no_data"``: no row / NULL / missing deps — ``value``
+      is a placeholder ``0.0`` and **must not** be shown as zero.
+    - ``value_status == "error"``: calculation failed — see
+      ``calculation_error``; ``value`` is again a placeholder ``0.0``.
+
+    Prefer ``measured_value`` (``float | None``) when bridging to nullable UI
+    fields so NO_DATA/ERROR do not look like a measured zero.
     """
 
     name: str
@@ -267,6 +292,19 @@ class KPIObservation(BaseModel):
     @property
     def has_value(self) -> bool:
         return self.value_status == "value"
+
+    @property
+    def measured_value(self) -> float | None:
+        """Nullable measurement for UI bridges; ``None`` when NO_DATA/ERROR."""
+        return self.value if self.has_value else None
+
+    @property
+    def is_no_data(self) -> bool:
+        return self.value_status == "no_data"
+
+    @property
+    def is_error(self) -> bool:
+        return self.value_status == "error"
 
 
 class Detection(BaseModel):

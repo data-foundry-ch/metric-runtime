@@ -50,17 +50,26 @@ class EvaluationContext(BaseModel):
         return self
 
     def bindings(self) -> dict[str, ScalarValue]:
-        """Logical parameter bindings for SQL / batch executors."""
+        """Logical parameter bindings for SQL / batch executors.
+
+        Window aliases (same underlying datetimes; ``effective_at`` semantics
+        are unchanged):
+
+        - ``effective_at`` / ``at`` / ``as_of_date``
+        - ``window_start`` / ``start_date``
+        - ``window_end`` / ``end_date``
+        """
         start = self.window_start or self.effective_at
         end = self.window_end or self.effective_at
         params: dict[str, ScalarValue] = {
             "effective_at": self.effective_at,
             "window_start": start,
             "window_end": end,
-            # Common aliases used in warehouse SQL.
+            # Common aliases used in warehouse / product SQL.
             "start_date": start,
             "end_date": end,
             "at": self.effective_at,
+            "as_of_date": self.effective_at,
         }
         for key, value in self.filters.items():
             params[str(key)] = value

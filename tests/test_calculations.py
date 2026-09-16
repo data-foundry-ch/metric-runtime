@@ -109,7 +109,7 @@ def test_sql_kpi_scalar_and_bindings():
             )
         ]
     )
-    session = EvaluationSession(catalog, executor=DuckDBExecutor(con, fact_table="fact_orders"))
+    session = EvaluationSession(catalog, executor=DuckDBExecutor(con))
     ctx = EvaluationContext(
         effective_at=_ts(2026, 5, 15, 12, 0),
         filters={"team": "enterprise"},
@@ -117,6 +117,78 @@ def test_sql_kpi_scalar_and_bindings():
     obs = session.evaluate(["closed_won_revenue"], ctx)["closed_won_revenue"]
     assert obs.value == 150000.0
     assert obs.value_status == ObservationValueStatus.VALUE.value
+
+
+def test_sql_kpi_local_bindings_and_context_override():
+    con = _sales_db()
+    catalog = KPICatalog(
+        [
+            KPI(
+                name="aged_open",
+                calculation=SqlCalculation(
+                    dialect="duckdb",
+                    query="""
+                        SELECT COUNT(*)::DOUBLE AS value
+                        FROM opportunity
+                        WHERE NOT is_won
+                          AND amount >= :aging_days
+                          AND close_date = :effective_at
+                    """,
+                    bindings={"aging_days": 25},
+                ),
+            )
+        ]
+    )
+    session = EvaluationSession(catalog, executor=DuckDBExecutor(con))
+    # Uses KPI default aging_days=25 → open opportunity amount=20000 counts.
+    default_obs = session.evaluate(
+        ["aged_open"],
+        EvaluationContext(effective_at=_ts(2026, 5, 15, 12, 0)),
+    )["aged_open"]
+    assert default_obs.value == 1.0
+
+    override = session.evaluate(
+        ["aged_open"],
+        EvaluationContext(
+            effective_at=_ts(2026, 5, 15, 12, 0),
+            filters={"aging_days": 25000},
+        ),
+    )["aged_open"]
+    assert override.value == 0.0
+
+    metric = catalog.get("aged_open")
+    restored = KPI.model_validate(metric.model_dump())
+    assert restored.calculation.bindings == {"aging_days": 25}
+    roundtrip = KPI.model_validate_json(metric.model_dump_json())
+    assert roundtrip.calculation.bindings["aging_days"] == 25
+
+
+def test_duckdb_executor_optional_fact_table():
+    con = _sales_db()
+    executor = DuckDBExecutor(con)
+    assert executor.fact_table is None
+    assert executor.execute_scalar("SELECT 42.0 AS value") == 42.0
+
+    with pytest.raises(MetricRuntimeError, match="requires fact_table"):
+        executor.metric_value(Formula.sum("orders"), at=_ts(2026, 5, 15, 12, 0))
+
+    catalog = KPICatalog(
+        [
+            KPI(
+                name="sql_only",
+                calculation=SqlCalculation(
+                    dialect="duckdb",
+                    query="SELECT SUM(amount) AS value FROM opportunity WHERE is_won",
+                ),
+            )
+        ]
+    )
+    session = EvaluationSession(catalog, executor=executor)
+    obs = session.evaluate(
+        ["sql_only"],
+        EvaluationContext(effective_at=_ts(2026, 5, 15, 12, 0)),
+    )["sql_only"]
+    assert obs.value == 230000.0
 
 
 def test_sql_null_is_no_data():
@@ -136,7 +208,7 @@ def test_sql_null_is_no_data():
             )
         ]
     )
-    session = EvaluationSession(catalog, executor=DuckDBExecutor(con, fact_table="fact_orders"))
+    session = EvaluationSession(catalog, executor=DuckDBExecutor(con))
     result = session.calculate_value(
         "missing", EvaluationContext(effective_at=_ts(2026, 5, 15, 12, 0))
     )
@@ -156,7 +228,7 @@ def test_sql_missing_value_column_fails():
             )
         ]
     )
-    session = EvaluationSession(catalog, executor=DuckDBExecutor(con, fact_table="fact_orders"))
+    session = EvaluationSession(catalog, executor=DuckDBExecutor(con))
     result = session.calculate_value("bad", EvaluationContext(effective_at=_ts(2026, 5, 15, 12, 0)))
     assert result.status == ObservationValueStatus.ERROR
     assert "value" in (result.error or "")
@@ -175,7 +247,7 @@ def test_sql_multiple_rows_fail():
             )
         ]
     )
-    session = EvaluationSession(catalog, executor=DuckDBExecutor(con, fact_table="fact_orders"))
+    session = EvaluationSession(catalog, executor=DuckDBExecutor(con))
     result = session.calculate_value(
         "multi", EvaluationContext(effective_at=_ts(2026, 5, 15, 12, 0))
     )
@@ -196,7 +268,7 @@ def test_sql_dialect_mismatch_fails_clearly():
             )
         ]
     )
-    session = EvaluationSession(catalog, executor=DuckDBExecutor(con, fact_table="fact_orders"))
+    session = EvaluationSession(catalog, executor=DuckDBExecutor(con))
     with pytest.raises(MetricRuntimeError, match="dialect"):
         session.calculate_value("sf", EvaluationContext(effective_at=_ts(2026, 5, 15, 12, 0)))
 
@@ -361,7 +433,7 @@ def test_mixed_calculation_graph_feeds_process(monkeypatch):
     )
     engine = KPIEngine(
         catalog,
-        executor=DuckDBExecutor(con, fact_table="fact_orders"),
+        executor=DuckDBExecutor(con),
         state_store=InMemoryStateStore(),
         batch_registry=registry,
         state_policy=StatePolicy(persistence=1, min_impact_eur=0.0),

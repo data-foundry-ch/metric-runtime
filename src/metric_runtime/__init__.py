@@ -37,6 +37,11 @@ from metric_runtime.models import (
     OutboxEvent,
     ProcessResult,
 )
+from metric_runtime.presentation import (
+    PresentationBand,
+    PresentationThreshold,
+    classify_presentation_band,
+)
 from metric_runtime.state import KPIStateTransition, StatePolicy
 from metric_runtime.stores import InMemoryStateStore
 
@@ -61,6 +66,8 @@ __all__ = [
     "InvestigationResult",
     "MetricStateRecord",
     "OutboxEvent",
+    "PresentationBand",
+    "PresentationThreshold",
     "ProcessResult",
     "Directionality",
     "Formula",
@@ -71,6 +78,7 @@ __all__ = [
     "ThresholdDetector",
     "InMemoryStateStore",
     "StatePolicy",
+    "classify_presentation_band",
     "investigate_metric",
     "investigate_window",
     "open_smart_incident",

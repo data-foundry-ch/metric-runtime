@@ -82,12 +82,40 @@ KPI(
 - Zero rows → `NO_DATA`
 - Multiple rows / missing column / SQL errors → explicit `ERROR`
 
+### KPI-local bindings
+
+`SqlCalculation.bindings` supply KPI-local defaults (e.g. thresholds like
+`aging_days`). They must be JSON-serializable scalars
+(`str|int|float|bool|None|datetime`) — never credentials.
+
+```python
+SqlCalculation(
+    dialect="duckdb",
+    query="""
+        SELECT COUNT(*) AS value
+        FROM opportunity
+        WHERE age_days >= :aging_days
+          AND close_date = :effective_at
+    """,
+    bindings={"aging_days": 30},
+)
+```
+
+**Precedence:** `EvaluationContext` bindings (window + filters + aliases)
+override KPI defaults on key conflicts. KPI bindings only fill missing keys.
+
+The same merge rule applies to `SqlBatchSource.bindings`.
+
 ### Dialect
 
 `dialect="duckdb"` means: this query is intended for a DuckDB-capable executor.
 
 Metric Runtime does **not** transpile DuckDB SQL to Snowflake/BigQuery.
 A dialect mismatch fails clearly.
+
+DuckDB may be used as a **SQL/batch-only** executor without a designated
+`fact_table`. Formula / measure aggregation still requires an explicit
+fact table.
 
 ## Batch calculations
 
@@ -143,9 +171,86 @@ EvaluationContext(
 )
 ```
 
-Logical bindings include `effective_at`, `window_start`/`window_end`,
-`start_date`/`end_date`, plus filter keys. Executors bind them safely — never
-string-concatenate filter values into SQL.
+Logical bindings include:
+
+| Binding | Meaning |
+|---|---|
+| `effective_at` | Business evaluation time (canonical) |
+| `at` / `as_of_date` | Aliases of `effective_at` (product filter convenience) |
+| `window_start` / `start_date` | Window start (defaults to `effective_at`) |
+| `window_end` / `end_date` | Window end (defaults to `effective_at`) |
+| filter keys | From `EvaluationContext.filters` |
+
+`as_of_date` does **not** change `effective_at` semantics — it is the same
+datetime under another name for product SQL that already uses that parameter.
+
+Executors bind parameters safely — never string-concatenate filter values into
+SQL.
+
+## Display metadata (embedders)
+
+First-class display fields on `KPI` (not layout):
+
+| Field | Purpose |
+|---|---|
+| `label` | Human-readable name (`display_name` falls back to title-cased `name`) |
+| `unit` | `count` / `ratio` / `eur` / `percent` / `unit` |
+| `format` | Optional format hint for UI bridges (e.g. `0.0%`, `#,##0`) |
+
+Use `kpi.display()` for `{label, unit, format}`. Keep layout
+(parent / ring / order) in `metadata["presentation"]` — product concern, not
+core semantics.
+
+## Presentation threshold bands
+
+Optional **presentation policy** only — not detectors, not alerts, not colors:
+
+```python
+from metric_runtime import (
+    PresentationThreshold,
+    classify_presentation_band,
+    Directionality,
+)
+
+band = classify_presentation_band(
+    observation.measured_value,
+    thresholds=PresentationThreshold(target=100, warning=90, critical=70),
+    directionality=Directionality.LOWER_IS_BAD,
+)
+# on_target | at_risk | off_target | no_data
+```
+
+Detectors and operational state remain authoritative for ops. Bands are for
+product UI bridges that need target / warning / critical presentation.
+
+## Observation null semantics
+
+`KPIObservation.value_status` is the source of truth for embedders:
+
+| `value_status` | Meaning | `value` field | Prefer |
+|---|---|---|---|
+| `value` | Real measurement (including legitimate `0.0`) | measured number | `measured_value` |
+| `no_data` | NULL / zero rows / missing deps | placeholder `0.0` | `measured_value is None` |
+| `error` | Calculation failed (`calculation_error`) | placeholder `0.0` | `measured_value is None` |
+
+Do **not** treat placeholder `0.0` as a measured zero when status is not
+`value`. Use `has_value` / `measured_value` / `is_no_data` / `is_error`.
+
+## Catalog interchange
+
+Minimal export/import (calculations included) — not a draft/publish server:
+
+```python
+schema = KPICatalog.json_schema()          # JSON Schema (array of KPI)
+text = catalog.to_json()                   # JSON array
+catalog = KPICatalog.from_json(text)
+lines = catalog.to_jsonl()                 # one KPI per line
+catalog = KPICatalog.from_jsonl(lines)
+catalog.write_jsonl("catalog.jsonl")
+catalog = KPICatalog.read_jsonl("catalog.jsonl")
+```
+
+Round-trips Formula / SQL / Batch / Derived calculations via Pydantic.
 
 ## Evaluation session
 

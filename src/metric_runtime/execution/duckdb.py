@@ -75,25 +75,24 @@ def _require_duckdb() -> Any:
 
 
 class DuckDBExecutor:
-    """Evaluate KPI formulas against a DuckDB database or connection."""
+    """Evaluate KPI formulas and SQL against a DuckDB database or connection.
+
+    ``fact_table`` is required for formula/measure aggregation against a
+    designated fact relation. Omit it for SQL/batch-only sessions.
+    """
 
     def __init__(
         self,
         path_or_connection: str | Path | Any,
         *,
-        fact_table: str,
+        fact_table: str | None = None,
         read_only: bool = True,
         valid_dimensions: set[str] | None = None,
         timestamp_column: str = "ts",
     ) -> None:
-        if not fact_table:
-            raise MetricRuntimeError(
-                "DuckDBExecutor requires an explicit fact_table "
-                "(set it in connections.yaml or pass fact_table=...)."
-            )
         duckdb = _require_duckdb()
         self.fact_table = fact_table
-        self._fact_sql = quote_relation(fact_table)
+        self._fact_sql = quote_relation(fact_table) if fact_table else None
         self._ts_sql = quote_identifier(timestamp_column)
         # None = do not restrict filter/dimension keys (catalog owns validity).
         self.valid_dimensions = valid_dimensions
@@ -105,6 +104,14 @@ class DuckDBExecutor:
         else:
             self.con = duckdb.connect(str(path_or_connection), read_only=read_only)
             self._owns_connection = True
+
+    def _require_fact_table_sql(self) -> str:
+        if self._fact_sql is None:
+            raise MetricRuntimeError(
+                "DuckDBExecutor requires fact_table for formula/measure evaluation; "
+                "omit it only for SQL/batch-only sessions."
+            )
+        return self._fact_sql
 
     def close(self) -> None:
         if self._owns_connection and self.con is not None:
@@ -187,10 +194,11 @@ class DuckDBExecutor:
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> float:
+        fact_sql = self._require_fact_table_sql()
         where, params = self._where_clause(at, filters, start, end)
         sql = f"""
             SELECT {self._metric_sql(formula)} AS value
-            FROM {self._fact_sql}
+            FROM {fact_sql}
             WHERE {where}
         """
         value = self.con.execute(sql, params).fetchone()[0]
@@ -205,11 +213,12 @@ class DuckDBExecutor:
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> float:
+        fact_sql = self._require_fact_table_sql()
         column = quote_identifier(coerce_measure_ref(measure))
         where, params = self._where_clause(at, filters, start, end)
         sql = f"""
             SELECT SUM({column})::DOUBLE
-            FROM {self._fact_sql}
+            FROM {fact_sql}
             WHERE {where}
         """
         value = self.con.execute(sql, params).fetchone()[0]
@@ -237,10 +246,11 @@ class DuckDBExecutor:
         where, params = self._where_clause(at, filters, start, end, valid_dimensions=allowed)
         quoted = [quote_identifier(d) for d in dimensions]
         columns = ", ".join(quoted)
+        fact_sql = self._require_fact_table_sql()
         rows = self.con.execute(
             f"""
             SELECT DISTINCT {columns}
-            FROM {self._fact_sql}
+            FROM {fact_sql}
             WHERE {where}
             ORDER BY {columns}
             """,
@@ -253,16 +263,18 @@ class DuckDBExecutor:
         ]
 
     def latest_timestamp(self) -> datetime | None:
-        latest = self.con.execute(f"SELECT MAX({self._ts_sql}) FROM {self._fact_sql}").fetchone()[0]
+        fact_sql = self._require_fact_table_sql()
+        latest = self.con.execute(f"SELECT MAX({self._ts_sql}) FROM {fact_sql}").fetchone()[0]
         if latest is None:
             return None
         return _from_duckdb_timestamp(latest)
 
     def row_count_at(self, at: datetime) -> int:
+        fact_sql = self._require_fact_table_sql()
         row = self.con.execute(
             f"""
             SELECT COUNT(*)::INTEGER
-            FROM {self._fact_sql}
+            FROM {fact_sql}
             WHERE {self._ts_sql} = ?
             """,
             [_bind_timestamp(at)],

@@ -84,10 +84,6 @@ class KPIEngine:
         if connection is not None and executor is None:
             from metric_runtime.execution.duckdb import DuckDBExecutor
 
-            if not fact_table:
-                raise MetricRuntimeError(
-                    "KPIEngine(connection=...) requires explicit fact_table=..."
-                )
             executor = DuckDBExecutor(connection, fact_table=fact_table)
 
         self.executor = executor

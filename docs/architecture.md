@@ -65,9 +65,10 @@ KPI definitions do **not** contain database credentials or infrastructure detail
 A `MetricExecutor` calculates formula observations from a resource.
 SQL/batch calculations use the executor's scalar/row SQL interface when present.
 
-`DuckDBExecutor` is the v0.1 analytical backend. Future backends (Snowflake,
-BigQuery, …) should plug in without changing KPI semantics. Metric Runtime does
-**not** transpile SQL across dialects.
+`DuckDBExecutor` is the v0.1 analytical backend. It can run SQL/batch-only
+sessions without a designated `fact_table`; formula/measure aggregation still
+requires one. Future backends (Snowflake, BigQuery, …) should plug in without
+changing KPI semantics. Metric Runtime does **not** transpile SQL across dialects.
 
 ## 3. Observations
 

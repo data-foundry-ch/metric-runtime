@@ -28,11 +28,15 @@ class SqlBatchSource:
         *,
         dialect: str | None = "duckdb",
         columns: tuple[str, ...] | None = None,
+        bindings: dict[str, object] | None = None,
     ) -> None:
+        from metric_runtime.calculations.specs import _validate_scalar_bindings
+
         self.name = name
         self.query = query.strip()
         self.dialect = dialect
         self.columns = columns
+        self.bindings = _validate_scalar_bindings(dict(bindings or {}))
         if not self.query:
             raise ValueError("SqlBatchSource.query must be non-empty")
 
@@ -76,7 +80,11 @@ class BatchRegistry:
         # Allow registering bare SqlBatchSource under an explicit name.
         if isinstance(source, SqlBatchSource) and source.name != key:
             source = SqlBatchSource(
-                key, source.query, dialect=source.dialect, columns=source.columns
+                key,
+                source.query,
+                dialect=source.dialect,
+                columns=source.columns,
+                bindings=source.bindings,
             )
         elif isinstance(source, CallableBatchSource) and source.name != key:
             source = CallableBatchSource(key, source._handler)

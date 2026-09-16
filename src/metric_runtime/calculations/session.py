@@ -26,6 +26,7 @@ from metric_runtime.calculations.specs import (
     DerivedCalculation,
     FormulaCalculation,
     SqlCalculation,
+    merge_parameter_bindings,
 )
 from metric_runtime.catalog import KPICatalog
 from metric_runtime.exceptions import (
@@ -175,10 +176,11 @@ class EvaluationSession:
         context: EvaluationContext,
     ) -> CalculationResult:
         executor = self._require_sql_executor(calc.dialect)
+        parameters = merge_parameter_bindings(context.bindings(), calc.bindings)
         try:
             value = executor.execute_scalar(
                 calc.query,
-                context.bindings(),
+                parameters,
                 dialect=calc.dialect,
                 value_column=calc.value_column,
             )
@@ -221,9 +223,10 @@ class EvaluationSession:
         source = self.batch_registry.get(source_name)
         if isinstance(source, SqlBatchSource):
             executor = self._require_sql_executor(source.dialect)
+            parameters = merge_parameter_bindings(context.bindings(), source.bindings)
             row = executor.execute_named_row(
                 source.query,
-                context.bindings(),
+                parameters,
                 dialect=source.dialect,
             )
             if source.columns:
