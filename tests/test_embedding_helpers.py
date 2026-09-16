@@ -27,21 +27,15 @@ from metric_runtime.exceptions import InvalidMetricDefinitionError
 def test_presentation_band_higher_is_better():
     thr = PresentationThreshold(target=100.0, warning=90.0, critical=70.0)
     assert (
-        classify_presentation_band(
-            95.0, thresholds=thr, directionality=Directionality.LOWER_IS_BAD
-        )
+        classify_presentation_band(95.0, thresholds=thr, directionality=Directionality.LOWER_IS_BAD)
         == PresentationBand.ON_TARGET
     )
     assert (
-        classify_presentation_band(
-            80.0, thresholds=thr, directionality=Directionality.LOWER_IS_BAD
-        )
+        classify_presentation_band(80.0, thresholds=thr, directionality=Directionality.LOWER_IS_BAD)
         == PresentationBand.AT_RISK
     )
     assert (
-        classify_presentation_band(
-            60.0, thresholds=thr, directionality=Directionality.LOWER_IS_BAD
-        )
+        classify_presentation_band(60.0, thresholds=thr, directionality=Directionality.LOWER_IS_BAD)
         == PresentationBand.OFF_TARGET
     )
 
@@ -49,9 +43,7 @@ def test_presentation_band_higher_is_better():
 def test_presentation_band_lower_is_better():
     thr = PresentationThreshold(target=5.0, warning=10.0, critical=20.0)
     assert (
-        classify_presentation_band(
-            4.0, thresholds=thr, directionality=Directionality.HIGHER_IS_BAD
-        )
+        classify_presentation_band(4.0, thresholds=thr, directionality=Directionality.HIGHER_IS_BAD)
         == PresentationBand.ON_TARGET
     )
     assert (
@@ -71,27 +63,19 @@ def test_presentation_band_lower_is_better():
 def test_presentation_band_two_sided_and_no_data():
     thr = PresentationThreshold(target=50.0, warning=5.0, critical=15.0)
     assert (
-        classify_presentation_band(
-            52.0, thresholds=thr, directionality=Directionality.TWO_SIDED
-        )
+        classify_presentation_band(52.0, thresholds=thr, directionality=Directionality.TWO_SIDED)
         == PresentationBand.ON_TARGET
     )
     assert (
-        classify_presentation_band(
-            60.0, thresholds=thr, directionality=Directionality.TWO_SIDED
-        )
+        classify_presentation_band(60.0, thresholds=thr, directionality=Directionality.TWO_SIDED)
         == PresentationBand.AT_RISK
     )
     assert (
-        classify_presentation_band(
-            80.0, thresholds=thr, directionality=Directionality.TWO_SIDED
-        )
+        classify_presentation_band(80.0, thresholds=thr, directionality=Directionality.TWO_SIDED)
         == PresentationBand.OFF_TARGET
     )
     assert (
-        classify_presentation_band(
-            None, thresholds=thr, directionality=Directionality.LOWER_IS_BAD
-        )
+        classify_presentation_band(None, thresholds=thr, directionality=Directionality.LOWER_IS_BAD)
         == PresentationBand.NO_DATA
     )
 
