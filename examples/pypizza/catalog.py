@@ -393,7 +393,7 @@ def build_catalog() -> dict[str, KPIDefinition]:
             metadata=_presentation(4, "finance"),
         ),
     ]
-    return {m.name: m for m in metrics}
+    return {m.id: m for m in metrics}
 
 
 # Visible talk graph: marketing left, finance right, operations bottom.

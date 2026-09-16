@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from metric_runtime.catalog import KPICatalog
+from metric_runtime.catalog import MetricCatalog
 from metric_runtime.detectors import DetectorStrategy, SeasonalZScoreDetector
 from metric_runtime.detectors.specs import build_detector
 from metric_runtime.exceptions import (
@@ -20,7 +20,6 @@ from metric_runtime.exceptions import (
 )
 from metric_runtime.identity import EvaluationKey, ensure_utc
 from metric_runtime.models import (
-    KPI,
     DetectorConfig,
     DrilldownRow,
     EvaluationRecord,
@@ -29,6 +28,7 @@ from metric_runtime.models import (
     KPIStateTransition,
     KPIStatus,
     MeasureRef,
+    Metric,
     MetricStateRecord,
     OutboxEvent,
     ProcessResult,
@@ -42,12 +42,12 @@ from metric_runtime.stores.memory import InMemoryStateStore
 
 
 def _resolve_detector(
-    metric: KPI,
+    metric: Metric,
     engine_default: DetectorStrategy,
 ) -> tuple[DetectorStrategy, DetectorConfig]:
-    """Return (strategy, config) for a KPI.
+    """Return (strategy, config) for a Metric.
 
-    KPI.detector is a serializable DetectorSpec (SeasonalZScore | Threshold).
+    Metric.detector is a serializable DetectorSpec (SeasonalZScore | Threshold).
     The engine builds the runtime DetectorStrategy via the registry/factory.
     """
     configured = metric.detector
@@ -62,7 +62,7 @@ class KPIEngine:
 
     def __init__(
         self,
-        catalog: KPICatalog | dict[str, KPI] | list[KPI],
+        catalog: MetricCatalog | dict[str, Metric] | list[Metric],
         executor=None,
         state_store=None,
         detector: DetectorStrategy | None = None,
@@ -74,12 +74,12 @@ class KPIEngine:
         preferred_leaves: tuple[str, ...] = (),
         batch_registry=None,
     ):
-        if isinstance(catalog, KPICatalog):
+        if isinstance(catalog, MetricCatalog):
             self._catalog = catalog
         elif isinstance(catalog, dict):
-            self._catalog = KPICatalog(catalog)
+            self._catalog = MetricCatalog(catalog)
         else:
-            self._catalog = KPICatalog(list(catalog))
+            self._catalog = MetricCatalog(list(catalog))
 
         if connection is not None and executor is None:
             from metric_runtime.execution.duckdb import DuckDBExecutor
@@ -99,16 +99,16 @@ class KPIEngine:
         self.con = getattr(executor, "con", connection)
 
     @property
-    def catalog(self) -> dict[str, KPI]:
+    def catalog(self) -> dict[str, Metric]:
         """Dict-like catalog for back-compat with demo/tests."""
         return self._catalog.as_dict()
 
     @property
-    def catalog_dict(self) -> dict[str, KPI]:
+    def catalog_dict(self) -> dict[str, Metric]:
         return self._catalog.as_dict()
 
     @property
-    def kpi_catalog(self) -> KPICatalog:
+    def kpi_catalog(self) -> MetricCatalog:
         return self._catalog
 
     @classmethod
@@ -118,7 +118,7 @@ class KPIEngine:
         *,
         project_config: str | Path | None = None,
         connections_config: str | Path | None = None,
-        catalog: KPICatalog | dict[str, KPI] | list[KPI] | None = None,
+        catalog: MetricCatalog | dict[str, Metric] | list[Metric] | None = None,
     ) -> KPIEngine:
         from metric_runtime.config.factory import build_runtime
 
@@ -137,7 +137,7 @@ class KPIEngine:
             )
         return self.executor
 
-    def _get_kpi(self, metric_name: str) -> KPI:
+    def _get_kpi(self, metric_name: str) -> Metric:
         try:
             return self._catalog.get(metric_name)
         except UnknownMetricError:

@@ -1,82 +1,64 @@
-# metric-runtime
+# Metric Runtime
 
-Executable semantics for business metrics.
+A Python-native framework for defining, validating, executing and
+operationalizing semantic business metrics.
 
 > [!WARNING]
 > metric-runtime is experimental.
 > APIs may change substantially before 1.0.
 
-Dashboards calculate and display metrics.
+## Four capabilities
 
-**metric-runtime** explores what happens when metrics become executable
-semantic objects with dependencies, detection strategies, state, ownership,
-and graph-aware investigation.
-
-Metrics aren't just numbers.
-A metric without context isn't intelligence. It's arithmetic.
+| | |
+|---|---|
+| **DEFINE** | Typed semantic metrics in Python/Pydantic |
+| **VALIDATE** | `MetricCatalog` + semantic dependency graph |
+| **EXECUTE** | Formula / SQL / Batch / Derived calculations |
+| **OPERATE** | Detection → State → Investigation → Incident |
 
 ```python
 from metric_runtime import (
-    Formula,
-    InMemoryStateStore,
-    KPI,
-    KPICatalog,
-    KPIEngine,
+    Metric,
+    MetricCatalog,
+    DerivedCalculation,
     SeasonalZScore,
+    Directionality,
 )
-from metric_runtime.models import Directionality
 
-profit_margin = KPI(
-    name="profit_margin",
-    owner="commercial-finance",
-    formula=Formula.ratio("profit", "revenue"),
-    dependencies=[
-        "average_order_value",
-        "average_cost_per_order",
-    ],
+profit_margin = Metric(
+    id="profit_margin",
+    name="Profit Margin",
+    description="Contribution profit as a percentage of revenue.",
+    calculation=DerivedCalculation(expression="profit / revenue"),
+    dependencies=["profit", "revenue"],
+    dimensions=["country", "channel"],
+    unit="percent",
+    owner="finance",
     directionality=Directionality.LOWER_IS_BAD,
     detector=SeasonalZScore(lookback_periods=6, threshold=3.0),
 )
 
-catalog = KPICatalog([profit_margin])  # include dependency KPIs in real use
-engine = KPIEngine(
-    catalog=catalog,
-    state_store=InMemoryStateStore(),
-)
+catalog = MetricCatalog([profit_margin])  # include dependency metrics in real use
+catalog.validate()
 ```
 
-A metric-runtime KPI can know:
+A `Metric` is not merely a calculation. It carries stable identity, human
+meaning, calculation, dependencies, dimensions, unit, ownership, and detector
+behavior. A Python package / Git repo becomes a **semantic metrics repository**.
 
-- what it means
-- how it is calculated
-- what explains it
-- what dimensions are valid
-- how abnormality is detected (serializable detector specs)
-- who owns it
-- its operational state
+`id` is machine identity. `name` is presentation. Renaming the display label
+does not change history, dependencies, or runtime keys.
 
-Detector policies are JSON-safe specs. The engine builds the runtime strategy:
-
-```python
-encoded = profit_margin.model_dump_json()
-restored = KPI.model_validate_json(encoded)
-assert restored == profit_margin
-```
-
-## Architecture
+## Execute & operate
 
 ```
-Metric semantics
+MetricCatalog
+      ↓
+EvaluationSession / calculations
       ↓
 Observation
       ↓
-Detection
-      ↓
-State
-      ↓
-Graph investigation
-      ↓
-Incident / Action
+Detection → State → Investigation → Incident / Outbox
 ```
 
 Detection asks whether something is unusual.
@@ -84,210 +66,93 @@ State determines whether the organization should care yet.
 
 **An anomaly is not an alert.**
 
+## Building products on Metric Runtime
+
+Metric Runtime owns semantic metric definitions.
+
+Products may add draft/publish, organization scope, collections, permissions,
+layout, and editors — prefer composition:
+
+```python
+class ProductMetric(BaseModel):
+    metric: Metric
+    lifecycle: Literal["draft", "published", "archived"]
+```
+
+rather than copying the semantic schema. See
+[docs/product-integration.md](docs/product-integration.md).
+
 ## Why metric-runtime?
 
-- **Executable semantics** — KPIs are typed objects, not spreadsheet cells
-- **Graph-aware investigation** — follow business dependencies, not only dashboards
+- **Metrics-as-code** — author catalogs in Python; exchange via JSON
+- **Executable semantics** — typed objects, not spreadsheet cells
+- **Graph-aware investigation** — follow business dependencies
 - **Pluggable detection** — the z-score is one detector, not the architecture
 - **Stateful metrics** — NORMAL → DETECTED → OPEN → …
 - **Smart routing** — alert the owner best positioned to act
 
 Don't poll the whole business. Propagate change through it.
-Business semantics become software.
 
-## Four ways to calculate a KPI
+## Calculations
 
-See [docs/calculations.md](docs/calculations.md) for the full guide.
-
-### Formula
-
-Simple aggregation over known fact-table measures:
+See [docs/calculations.md](docs/calculations.md). Formula sugar still works:
 
 ```python
-from metric_runtime.calculations import FormulaCalculation
-
-KPI(
-    name="orders",
-    calculation=FormulaCalculation(formula=Formula.sum("orders")),
-)
+Metric(id="orders", name="Orders", formula=Formula.sum("orders"))
 ```
 
-### SQL
+## Metric repositories
 
-Arbitrary parameterized relational logic (no SQL transpilation):
-
-```python
-from metric_runtime.calculations import SqlCalculation
-
-KPI(
-    name="closed_won_revenue",
-    calculation=SqlCalculation(
-        dialect="duckdb",
-        query="SELECT SUM(amount) AS value FROM opportunity WHERE is_won AND close_date = :effective_at",
-    ),
-)
-```
-
-### Batch
-
-Many KPIs sharing one expensive query (execution optimization, not a semantic edge):
-
-```python
-from metric_runtime.calculations import BatchCalculation
-
-BatchCalculation(source="sales_metrics", result="pipeline_coverage")
-```
-
-### Derived
-
-Compute from already-evaluated KPIs with a safe expression language:
-
-```python
-from metric_runtime.calculations import DerivedCalculation
-
-DerivedCalculation(expression="closed_won_revenue / bookings_target")
-```
-
-The authoritative loop is ``KPIEngine.process`` (alias ``tick``):
-
-```python
-from datetime import UTC, datetime
-
-result = engine.process(
-    metric="profit_margin",
-    at=datetime(2026, 5, 15, 12, 0, tzinfo=UTC),
-    scope={"city": "Amsterdam"},
-)
-# result.transition == (previous_state, current_state)
-# result.new_incidents / result.notifications only on meaningful changes
-# retries with the same EvaluationKey return the committed result
-```
-
-## Quick start
-
-### A. Pure Python (embedding)
+See [docs/metric-repositories.md](docs/metric-repositories.md) and
+`examples/company_metrics/`.
 
 ```bash
-pip install -e ".[duckdb,dev]"
+metric-runtime validate
+metric-runtime catalog list
+metric-runtime catalog show profit_margin
+metric-runtime catalog export --format json -o catalog.json
 ```
 
-```python
-from metric_runtime import Formula, InMemoryStateStore, KPI, KPICatalog, KPIEngine, SeasonalZScore
-from metric_runtime.execution import DuckDBExecutor
-from metric_runtime.models import Directionality
+## Compatibility
 
-catalog = KPICatalog([
-    KPI(
-        name="requests",
-        owner="growth",
-        formula=Formula.sum("requests"),
-        directionality=Directionality.TWO_SIDED,
-    ),
-    KPI(
-        name="customers",
-        owner="growth",
-        formula=Formula.sum("customers"),
-        dependencies=("requests",),
-    ),
-    KPI(
-        name="conversion_rate",
-        owner="growth",
-        formula=Formula.ratio("customers", "requests"),
-        dependencies=("customers", "requests"),
-        directionality=Directionality.LOWER_IS_BAD,
-        detector=SeasonalZScore(lookback_periods=6, threshold=3.0),
-    ),
-    KPI(
-        name="recurring_revenue",
-        owner="finance",
-        formula=Formula.sum("recurring_revenue"),
-        dependencies=("customers",),
-        directionality=Directionality.LOWER_IS_BAD,
-        detector=SeasonalZScore(lookback_periods=6, threshold=2.5),
-    ),
-])
+`KPI` / `KPICatalog` remain temporary aliases for `Metric` / `MetricCatalog`.
+See [docs/migration-metric-model.md](docs/migration-metric-model.md).
 
-engine = KPIEngine(
-    catalog=catalog,
-    executor=DuckDBExecutor("metrics.duckdb", fact_table="daily_metrics"),
-    state_store=InMemoryStateStore(),
-)
+## Architecture
+
+```
+           Metric Repository
+                   │
+                   ▼
+             MetricCatalog
+       ┌───────────┴───────────┐
+       │                       │
+       ▼                       ▼
+  Introspection             Runtime
+  JSON / schema             Execution
+  Docs / diffs              Detection
+                            State
+                            Investigation
 ```
 
-### B. Deployment configuration
+More detail: [docs/architecture.md](docs/architecture.md).
 
-If you use dbt, the separation should feel familiar: project semantics live
-with the code; environment-specific connections live outside it.
+## Examples
 
-| Concept | metric-runtime | analogous dbt idea |
-|---|---|---|
-| Project behavior | `metric-runtime.yaml` | `dbt_project.yml` |
-| Environment resources | `connections.yaml` | `profiles.yml` |
+- `examples/company_metrics/` — Python metric repository
+- `examples/sql_catalog/` — SQL / batch / derived calculations
+- `examples/pypizza/` — flagship lunch-delivery scenario (Great Lunch talk)
 
-metric-runtime does **not** require dbt and is **not** compatible with dbt configs.
+## Install
 
 ```bash
-metric-runtime validate \
-  --project-config examples/pypizza/metric-runtime.yaml \
-  --connections examples/pypizza/connections.yaml \
-  --profile local
-
-metric-runtime config show --profile local \
-  --project-config examples/pypizza/metric-runtime.yaml \
-  --connections examples/pypizza/connections.yaml
-
-metric-runtime run --profile local \
-  --project-config examples/pypizza/metric-runtime.yaml \
-  --connections examples/pypizza/connections.yaml
+pip install metric-runtime
+# or with DuckDB backend:
+pip install "metric-runtime[duckdb]"
 ```
-
-The first style is convenient for embedding metric-runtime in Python applications.
-The second is convenient for repeatable deployments.
-
-## Core concepts
-
-| Concept | Role |
-|---|---|
-| KPI | What the metric means |
-| Executor | How to calculate it |
-| Connection | Where the underlying data lives |
-| Detector | Whether an observation is unusual |
-| State store | What metric-runtime already concluded |
-| Dependency graph | What explains this metric |
-| Incident | Whether somebody should act |
-| Notifier | How that action reaches them |
-
-See [docs/concepts.md](docs/concepts.md) and [docs/architecture.md](docs/architecture.md).
-
-## PyPizza example
-
-The flagship example from the PyData talk
-[*Your Dashboard Is Too Late*](docs/conference-talk.md):
-
-```bash
-pip install -e ".[demo,dev]"
-python examples/pypizza/generate_data.py
-marimo run examples/pypizza/app.py
-```
-
-Details: [examples/pypizza/README.md](examples/pypizza/README.md)
-
-## Production considerations
-
-v0.1 is an experimental library, not a full monitoring platform.
-
-See [docs/production.md](docs/production.md).
-
-## Project status
-
-- Version: **0.1.0** (Alpha / Experimental)
-- License: MIT
-- Python: ≥ 3.11
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT
+
+- Version: **0.2.0** (Alpha / Experimental)

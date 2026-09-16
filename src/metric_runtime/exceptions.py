@@ -12,11 +12,15 @@ class InvalidMetricDefinitionError(MetricRuntimeError):
 
 
 class UnknownMetricError(MetricRuntimeError):
-    """Referenced metric name does not exist in the catalog."""
+    """Referenced metric id does not exist in the catalog."""
+
+
+class UnknownDependencyError(UnknownMetricError):
+    """A metric declares a dependency that is not in the catalog."""
 
 
 class DependencyCycleError(MetricRuntimeError):
-    """KPI dependency graph contains a cycle."""
+    """Metric dependency graph contains a cycle."""
 
 
 class InsufficientSupportError(MetricRuntimeError):

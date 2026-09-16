@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
 from metric_runtime.config.duration import parse_duration
 
@@ -20,8 +20,23 @@ class ProjectMeta(BaseModel):
 
 
 class CatalogConfig(BaseModel):
+    """Semantic catalog loading.
+
+    Prefer ``entrypoint: python.module.path:attribute`` pointing at a
+    ``MetricCatalog`` (or ``build_catalog`` / ``CATALOG`` on a module).
+    ``module`` remains as a deprecated alias for entrypoint without an
+    attribute suffix.
+    """
+
+    entrypoint: str | None = None
     path: str | None = None
     module: str | None = None
+
+    @model_validator(mode="after")
+    def _normalize_entrypoint(self) -> CatalogConfig:
+        if self.entrypoint is None and self.module:
+            object.__setattr__(self, "entrypoint", self.module)
+        return self
 
 
 class RuntimeConfig(BaseModel):

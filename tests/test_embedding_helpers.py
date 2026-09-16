@@ -92,13 +92,15 @@ def test_kpi_display_fields():
     )
     assert metric.display() == {
         "label": "Revenue Attainment",
-        "unit": "percent",
+        "name": "Revenue Attainment",
+        "unit": {"id": "percent", "symbol": "%", "description": None},
         "format": "0.0%",
     }
     assert metric.presentation() == {"graph_ring": 2}
     restored = KPI.model_validate_json(metric.model_dump_json())
     assert restored.format == "0.0%"
-    assert restored.unit == "percent"
+    assert restored.unit.id == "percent"
+    assert restored.id == "revenue_attainment"
 
 
 def test_evaluation_context_as_of_date_alias():
@@ -170,8 +172,8 @@ def test_catalog_json_and_jsonl_round_trip(tmp_path):
     )
 
     schema = KPICatalog.json_schema()
-    assert schema["type"] == "array"
-    assert "items" in schema
+    assert schema["type"] == "object"
+    assert "metrics" in schema["properties"]
 
     restored_json = KPICatalog.from_json(catalog.to_json())
     assert set(restored_json.names()) == set(catalog.names())

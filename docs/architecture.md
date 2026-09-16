@@ -1,11 +1,40 @@
 # Architecture
 
-metric-runtime turns business metrics into executable semantic objects.
+Metric Runtime is a Python-native framework for **defining, validating,
+executing and operationalizing** semantic business metrics.
 
 ```
-Catalog
+                   Metric Repository
+                         │
+                         ▼
+                   MetricCatalog
+             ┌───────────┴───────────┐
+             │                       │
+             ▼                       ▼
+        Introspection             Runtime
+        JSON/schema               Execution
+        Docs/diffs                Detection
+                                  State
+                                  Investigation
+```
+
+Product composition (outside core):
+
+```
+             Metric
+               │
+               ▼
+        Product wrapper
+    draft/publish/layout/auth
+```
+
+Core owns the semantic contract. Products wrap it — they do not redefine
+calculation, dependencies, unit, detector, or owner.
+
+```
+MetricCatalog
 │
-├── KPI semantics (owner, deps, detector, …)
+├── Metric semantics (id, owner, deps, detector, …)
 │
 └── Calculation specs
         │
@@ -21,7 +50,7 @@ EvaluationSession / planner
 Executor(s)
         │
         ▼
-KPIObservation
+KPIObservation  (identity = Metric.id)
         │
         ▼
 Runtime lifecycle
@@ -37,7 +66,7 @@ Runtime lifecycle
 
 | Layer | Owns |
 |---|---|
-| Metric Runtime | calculation contracts, evaluation orchestration, observation creation, state lifecycle |
+| Metric Runtime | semantic contract, calculation contracts, evaluation orchestration, observation creation, state lifecycle |
 | Executor | connection-specific mechanics (DuckDB SQL binding, fact-table aggregates) |
 | Application | domain SQL, batch registrations, catalog definitions |
 

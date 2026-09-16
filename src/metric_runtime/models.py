@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import warnings
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
@@ -16,6 +19,8 @@ from pydantic import (
 
 from metric_runtime.detectors.policy import SeasonalZScore, Threshold
 from metric_runtime.identity import EvaluationKey, parse_datetime
+from metric_runtime.ids import MetricId, validate_metric_id
+from metric_runtime.units import UnitSpec, coerce_unit
 
 _MEASURE_REF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -163,19 +168,22 @@ def _default_detector_spec() -> SeasonalZScore:
     return SeasonalZScore()
 
 
-class KPI(BaseModel):
-    """Executable semantic object for a business metric.
+def _canonical_json_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
 
-    A KPI says what the metric means. The runtime profile says where it
-    is evaluated. ``calculation`` defines how the value is obtained.
 
-    Display fields for embedders: ``label``, ``unit``, ``format``.
-    Layout hints (parent / ring / order) belong in ``metadata`` (or the
-    product layer), not as first-class core fields.
+class Metric(BaseModel):
+    """Canonical semantic metric definition.
+
+    ``id`` is stable machine identity (dependencies, state, observations).
+    ``name`` is the human-facing display label.
+
+    Product workflow fields (draft/publish, layout, tenancy, RBAC) do **not**
+    belong here — wrap ``Metric`` in a product model instead.
     """
 
-    name: str
-    label: str | None = None
+    id: MetricId
+    name: str = ""
     description: str = ""
     owner: str = ""
     calculation: Any = Field(
@@ -191,12 +199,67 @@ class KPI(BaseModel):
     )
     support: SupportRequirement | None = None
     impact: ImpactModel = Field(default_factory=ImpactModel)
-    unit: Literal["count", "ratio", "eur", "percent", "unit"] = "unit"
+    unit: UnitSpec = Field(default_factory=lambda: UnitSpec(id="unit"))
     format: str | None = Field(
         default=None,
         description="Optional display format hint for embedders (e.g. '0.0%', '#,##0').",
     )
+    tags: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_identity(cls, data: Any) -> Any:
+        """Accept legacy KPI JSON where ``name`` was the machine id."""
+        if not isinstance(data, dict):
+            return data
+        payload = dict(data)
+        if "id" not in payload and "name" in payload:
+            candidate = payload.get("name")
+            if isinstance(candidate, str):
+                try:
+                    validate_metric_id(candidate)
+                except Exception:  # noqa: BLE001
+                    pass
+                else:
+                    payload["id"] = payload.pop("name")
+                    if "label" in payload and not payload.get("name"):
+                        payload["name"] = payload.pop("label")
+                    else:
+                        payload.pop("label", None)
+        elif "label" in payload:
+            label = payload.pop("label")
+            if not payload.get("name"):
+                payload["name"] = label
+        return payload
+
+    @field_validator("unit", mode="before")
+    @classmethod
+    def _coerce_unit(cls, value: Any) -> Any:
+        return coerce_unit(value)
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _normalize_tags(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, (set, frozenset, tuple, list)):
+            return sorted({str(item).strip() for item in value if str(item).strip()})
+        raise TypeError("tags must be a list/set of strings")
+
+    @field_validator("dependencies", "dimensions", mode="before")
+    @classmethod
+    def _tuple_ids(cls, value: Any) -> Any:
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            return (value,)
+        return tuple(value)
+
+    @field_validator("dependencies")
+    @classmethod
+    def _validate_dependency_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(validate_metric_id(item) for item in value)
 
     @field_validator("detector", mode="before")
     @classmethod
@@ -212,12 +275,21 @@ class KPI(BaseModel):
 
         return coerce_calculation(value)
 
+    @field_validator("metadata")
+    @classmethod
+    def _json_safe_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            json.dumps(value, default=str)
+        except TypeError as exc:
+            raise ValueError(f"metadata must be JSON-serializable: {exc}") from exc
+        return value
+
     @model_validator(mode="after")
-    def _defaults(self) -> KPI:
+    def _defaults(self) -> Metric:
         from metric_runtime.calculations.specs import FormulaCalculation
 
-        if self.label is None:
-            object.__setattr__(self, "label", self.name.replace("_", " ").title())
+        if not self.name:
+            object.__setattr__(self, "name", self.id.replace("_", " ").title())
 
         # Canonicalize: calculation is authoritative; formula is sugar.
         if self.calculation is None and self.formula is not None:
@@ -226,29 +298,82 @@ class KPI(BaseModel):
             if self.formula is None:
                 object.__setattr__(self, "formula", self.calculation.formula)
             elif self.formula != self.calculation.formula:
-                raise ValueError(f"KPI {self.name!r}: formula and calculation.formula disagree")
+                raise ValueError(f"Metric {self.id!r}: formula and calculation.formula disagree")
         return self
 
     @property
     def display_name(self) -> str:
-        return self.label or self.name
+        """Human-facing label (``name``)."""
+        return self.name or self.id
+
+    @property
+    def label(self) -> str:
+        """Deprecated alias for display ``name`` (KPI compatibility)."""
+        return self.display_name
 
     def display(self) -> dict[str, Any]:
-        """Product display hints: label / unit / format (not layout)."""
+        """Product display hints: name / unit / format (not layout)."""
         return {
             "label": self.display_name,
-            "unit": self.unit,
+            "name": self.display_name,
+            "unit": self.unit.model_dump(mode="json"),
             "format": self.format,
         }
 
     def presentation(self) -> dict[str, Any]:
         """Optional layout/example hints stored under metadata['presentation'].
 
-        Prefer ``display()`` for unit/label/format. Keep graph parent/ring/order
+        Prefer ``display()`` for name/unit/format. Keep graph parent/ring/order
         in metadata — not first-class core fields.
         """
         raw = self.metadata.get("presentation")
         return dict(raw) if isinstance(raw, dict) else {}
+
+    def semantic_payload(self) -> dict[str, Any]:
+        """Fields that affect executable / routing semantics."""
+        return {
+            "id": self.id,
+            "calculation": (
+                self.calculation.model_dump(mode="json") if self.calculation is not None else None
+            ),
+            "dependencies": list(self.dependencies),
+            "dimensions": list(self.dimensions),
+            "unit": self.unit.model_dump(mode="json"),
+            "detector": self.detector.model_dump(mode="json"),
+            "directionality": self.directionality.value,
+            "support": self.support.model_dump(mode="json") if self.support else None,
+            "impact": self.impact.model_dump(mode="json"),
+            "owner": self.owner,
+        }
+
+    def semantic_hash(self) -> str:
+        """SHA-256 of executable semantics (excludes display name/description/tags)."""
+        return hashlib.sha256(_canonical_json_bytes(self.semantic_payload())).hexdigest()
+
+    def content_hash(self) -> str:
+        """SHA-256 of the full metric document (including display fields)."""
+        return hashlib.sha256(_canonical_json_bytes(self.model_dump(mode="json"))).hexdigest()
+
+
+class KPI(Metric):
+    """Deprecated compatibility alias for :class:`Metric`.
+
+    Legacy authoring used ``name`` as machine id and ``label`` as display name.
+    Prefer::
+
+        Metric(id=\"profit_margin\", name=\"Profit Margin\", ...)
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _warn_deprecated(cls, data: Any) -> Any:
+        warnings.warn(
+            "KPI is deprecated; use Metric(id=..., name=...). "
+            "KPI remains a temporary compatibility alias.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return data
 
 
 # Back-compat alias.
@@ -260,6 +385,9 @@ class KPIObservation(BaseModel):
 
     Detection asks whether something is unusual.
     An observation alone is not an alert.
+
+    ``name`` stores the stable :class:`Metric` id (historical field name).
+    Prefer ``metric_id`` for new code.
 
     Null semantics for embedders / UI bridges:
 
@@ -283,11 +411,17 @@ class KPIObservation(BaseModel):
     baseline_values: list[float] = Field(default_factory=list)
     value_status: str = "value"
     calculation_error: str | None = None
+    metric_definition_hash: str | None = None
 
     @field_validator("as_of", mode="before")
     @classmethod
     def _coerce_as_of(cls, value: Any) -> datetime:
         return parse_datetime(value)
+
+    @property
+    def metric_id(self) -> str:
+        """Stable Metric.id (same string as ``name``)."""
+        return self.name
 
     @property
     def has_value(self) -> bool:

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metric-runtime"
-version = "0.1.0"
-description = "Executable semantics for business metrics — define KPIs with dependencies, detection, state, ownership, and graph-aware investigation."
+version = "0.2.0"
+description = "Python-native framework for defining, validating, executing and operationalizing semantic business metrics."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -79,6 +79,9 @@ metric_runtime = ["py.typed"]
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
 testpaths = ["tests"]
+filterwarnings = [
+  "ignore:KPI is deprecated:DeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 100

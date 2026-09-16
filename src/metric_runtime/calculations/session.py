@@ -105,7 +105,7 @@ class EvaluationSession:
         observations: dict[str, KPIObservation] = {}
         for name in plan.closure:
             result = results[name]
-            observations[name] = self._to_observation(name, result, context)
+            observations[name] = self._observation_for(name, result, context)
         return {name: observations[name] for name in metric_names if name in observations}
 
     def evaluate_all(
@@ -118,7 +118,7 @@ class EvaluationSession:
         results: dict[str, CalculationResult] = {}
         for name in plan.ordered:
             results[name] = self._evaluate_metric(name, context, results)
-        return {name: self._to_observation(name, results[name], context) for name in plan.closure}
+        return {name: self._observation_for(name, results[name], context) for name in plan.closure}
 
     def calculate_value(
         self,
@@ -274,7 +274,7 @@ class EvaluationSession:
             return metric.calculation
         if metric.formula is not None:
             return FormulaCalculation(formula=metric.formula)
-        raise MetricRuntimeError(f"KPI {name!r} has no calculation")
+        raise MetricRuntimeError(f"Metric {name!r} has no calculation")
 
     def _dependency_closure(self, metric_names: Sequence[str]) -> list[str]:
         seen: set[str] = set()
@@ -319,13 +319,13 @@ class EvaluationSession:
                 declared = set(metric.dependencies)
                 if not ids.issubset(declared):
                     raise InvalidMetricDefinitionError(
-                        f"KPI {metric.name!r} derived expression references "
+                        f"Metric {metric.id!r} derived expression references "
                         f"{sorted(ids - declared)} which are not declared in dependencies"
                     )
                 for ident in ids:
                     if ident not in self.catalog:
                         raise UnknownMetricError(
-                            f"KPI {metric.name!r} derived expression references "
+                            f"Metric {metric.id!r} derived expression references "
                             f"unknown metric {ident!r}"
                         )
             if isinstance(calc, BatchCalculation) and calc.source not in self.batch_registry:
@@ -363,6 +363,8 @@ class EvaluationSession:
         name: str,
         result: CalculationResult,
         context: EvaluationContext,
+        *,
+        definition_hash: str | None = None,
     ) -> KPIObservation:
         filters = {str(k): str(v) for k, v in context.filters.items() if v is not None}
         if result.status == ObservationValueStatus.VALUE and result.value is not None:
@@ -372,6 +374,7 @@ class EvaluationSession:
                 as_of=context.effective_at,
                 filters=filters,
                 value_status=ObservationValueStatus.VALUE.value,
+                metric_definition_hash=definition_hash,
             )
         return KPIObservation(
             name=name,
@@ -381,7 +384,21 @@ class EvaluationSession:
             support_ok=False,
             value_status=result.status.value,
             calculation_error=result.error,
+            metric_definition_hash=definition_hash,
         )
+
+    def _observation_for(
+        self,
+        name: str,
+        result: CalculationResult,
+        context: EvaluationContext,
+    ) -> KPIObservation:
+        definition_hash = None
+        try:
+            definition_hash = self.catalog.get(name).semantic_hash()
+        except Exception:  # noqa: BLE001
+            definition_hash = None
+        return self._to_observation(name, result, context, definition_hash=definition_hash)
 
 
 def build_evaluation_context(
