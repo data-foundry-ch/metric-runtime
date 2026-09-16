@@ -20,6 +20,7 @@ from metric_runtime.models import (
 
 def test_kpi_display_name_default():
     k = KPI(name="profit_margin", owner="finance")
+    assert k.id == "profit_margin"
     assert k.display_name == "Profit Margin"
 
 
@@ -38,6 +39,7 @@ def test_kpi_json_round_trip():
     assert restored == metric
     assert isinstance(restored.detector, SeasonalZScore)
     assert restored.detector.threshold == 3.0
+    assert restored.id == "conversion_rate"
 
 
 def test_kpi_json_round_trip_threshold_detector():
@@ -55,15 +57,16 @@ def test_kpi_json_round_trip_threshold_detector():
 def test_kpi_model_json_schema():
     schema = KPI.model_json_schema()
     assert schema["type"] == "object"
+    assert "id" in schema["properties"]
     assert "name" in schema["properties"]
     assert "detector" in schema["properties"]
     assert "formula" in schema["properties"]
-    assert "label" in schema["properties"]
     assert "unit" in schema["properties"]
     assert "format" in schema["properties"]
-    # Presentation layout is not a first-class KPI field.
+    # Presentation layout is not a first-class Metric field.
     assert "graph_ring" not in schema["properties"]
     assert "graph_side" not in schema["properties"]
+    assert "label" not in schema["properties"]
 
 
 def test_status_to_observation_and_detection():

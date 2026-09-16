@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - Unreleased
+
+### Added
+
+- Canonical ``Metric`` model with stable ``id`` and display ``name``
+- ``MetricCatalog`` repository API (graph ops, snapshot, JSON/JSONL, schema, hashes, diff, Markdown docs)
+- Extensible ``UnitSpec`` (arbitrary business units; no conversion algebra)
+- ``tags`` on Metric; ``Metric.semantic_hash()`` / ``content_hash()``
+- Catalog entrypoint ``module.path:attribute`` in ``metric-runtime.yaml``
+- CLI: ``catalog list|show|export|schema|diff|docs``
+- Offline catalog validation without warehouse I/O
+- ``examples/company_metrics`` Python metric repository
+- Docs: ``metric-repositories.md``, ``product-integration.md``, ``migration-metric-model.md``, ADR 0002
+- Optional ``KPIObservation.metric_definition_hash`` provenance
+
+### Changed
+
+- ``Metric.id`` is machine identity for dependencies, graph, observations, state, and incidents
+- Units are no longer a closed ``eur|percent|…`` enum
+- Version bump to **0.2.0**
+
+### Deprecated
+
+- ``KPI`` / ``KPICatalog`` — temporary aliases for ``Metric`` / ``MetricCatalog`` (see migration guide)
+
+### Migration
+
+See [docs/migration-metric-model.md](docs/migration-metric-model.md).
+
 ## [0.1.0] - Unreleased
 
 ### Added

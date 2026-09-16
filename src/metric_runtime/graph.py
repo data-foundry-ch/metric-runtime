@@ -6,32 +6,34 @@ Graph visualization / presentation layout belongs in the example layer.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 import networkx as nx
 
-from metric_runtime.models import KPI, Directionality, KPIStatus
+from metric_runtime.models import Directionality, KPIStatus, Metric
 
 if TYPE_CHECKING:
     from metric_runtime.engine import KPIEngine
 
 
-def build_business_graph(catalog: dict[str, KPI]) -> nx.DiGraph:
+def build_business_graph(catalog: Mapping[str, Metric]) -> nx.DiGraph:
     g = nx.DiGraph()
-    for name, metric in catalog.items():
+    for metric_id, metric in catalog.items():
         g.add_node(
-            name,
+            metric_id,
+            name=metric.name,
             label=metric.display_name,
             owner=metric.owner,
             description=metric.description,
-            unit=metric.unit,
+            unit=metric.unit.id,
             directionality=metric.directionality.value,
         )
-    for name, metric in catalog.items():
+    for metric_id, metric in catalog.items():
         for dep in metric.dependencies:
             if dep in catalog:
-                g.add_edge(dep, name)
+                g.add_edge(dep, metric_id)
     return g
 
 
@@ -61,31 +63,31 @@ def evaluate_graph_state_window(
 
 
 def mark_root_candidates(
-    catalog: dict[str, KPI],
+    catalog: Mapping[str, Metric],
     statuses: dict[str, KPIStatus],
 ) -> dict[str, KPIStatus]:
     updated: dict[str, KPIStatus] = {}
-    for name, status in statuses.items():
+    for metric_id, status in statuses.items():
         is_root = False
         if status.anomaly:
-            directional = catalog[name].directionality in (
+            directional = catalog[metric_id].directionality in (
                 Directionality.LOWER_IS_BAD,
                 Directionality.HIGHER_IS_BAD,
             )
             blocking = []
-            for d in catalog[name].dependencies:
+            for d in catalog[metric_id].dependencies:
                 if d not in statuses or not statuses[d].anomaly:
                     continue
                 if catalog[d].directionality == Directionality.TWO_SIDED:
                     continue
                 blocking.append(d)
             is_root = directional and not blocking
-        updated[name] = status.model_copy(update={"root_candidate": is_root})
+        updated[metric_id] = status.model_copy(update={"root_candidate": is_root})
     return updated
 
 
 def find_explanatory_paths(
-    catalog: dict[str, KPI],
+    catalog: Mapping[str, Metric],
     statuses: dict[str, KPIStatus],
     start: str,
 ) -> list[list[str]]:

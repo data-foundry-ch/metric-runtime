@@ -40,7 +40,7 @@ jobs:
 
       - name: Import smoke
         run: |
-          python -c "import metric_runtime; from metric_runtime import KPI, KPICatalog, KPIEngine; print(metric_runtime.__version__)"
+          python -c "import metric_runtime; from metric_runtime import Metric, MetricCatalog, KPIEngine; print(metric_runtime.__version__)"
 
       - name: CLI validate (no DB connect beyond local file existence)
         run: |

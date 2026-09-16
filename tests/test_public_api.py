@@ -64,4 +64,4 @@ def test_readme_style_zero_infra_example():
 def test_import_has_no_side_effects():
     import metric_runtime
 
-    assert metric_runtime.__version__ == "0.1.0"
+    assert metric_runtime.__version__ == "0.2.0"

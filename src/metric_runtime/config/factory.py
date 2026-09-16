@@ -6,7 +6,7 @@ import importlib
 from pathlib import Path
 from typing import Any
 
-from metric_runtime.catalog import KPICatalog
+from metric_runtime.catalog import KPICatalog, MetricCatalog
 from metric_runtime.config.duration import parse_duration_minutes
 from metric_runtime.config.loader import (
     load_connections_config,
@@ -21,16 +21,12 @@ from metric_runtime.config.models import (
 )
 from metric_runtime.engine import KPIEngine
 from metric_runtime.exceptions import ConfigurationError, UnknownConnectionError
-from metric_runtime.models import KPI
+from metric_runtime.models import KPI, Metric
 from metric_runtime.state import StatePolicy
 from metric_runtime.stores.memory import InMemoryStateStore
 
 
-def _load_catalog_from_module(
-    module_path: str,
-    *,
-    base_dir: Path | None = None,
-) -> KPICatalog:
+def _ensure_sys_path(base_dir: Path | None) -> None:
     import sys
 
     roots: list[Path] = []
@@ -44,27 +40,77 @@ def _load_catalog_from_module(
         candidate = str(root)
         if marker.exists() and candidate not in sys.path:
             sys.path.insert(0, candidate)
-            break
-    else:
-        for root in roots:
-            candidate = str(root)
-            if candidate not in sys.path:
-                sys.path.insert(0, candidate)
-                break
+            return
+    for root in roots:
+        candidate = str(root)
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
+            return
 
-    module = importlib.import_module(module_path)
-    if hasattr(module, "build_catalog"):
-        built = module.build_catalog()
-        if isinstance(built, KPICatalog):
-            return built
-        if isinstance(built, dict):
-            return KPICatalog(built)
-        return KPICatalog(list(built))
-    if hasattr(module, "CATALOG"):
-        return KPICatalog(module.CATALOG)
+
+def _coerce_catalog(obj: Any, *, source: str) -> MetricCatalog:
+    if isinstance(obj, MetricCatalog):
+        return obj
+    if isinstance(obj, dict):
+        return MetricCatalog(obj)
+    if isinstance(obj, (list, tuple)):
+        return MetricCatalog(list(obj))
     raise ConfigurationError(
-        f"Catalog module {module_path!r} must expose build_catalog() or CATALOG"
+        f"Catalog entrypoint {source!r} must resolve to a MetricCatalog "
+        f"(or list/dict of Metric), got {type(obj)!r}"
     )
+
+
+def load_catalog_entrypoint(
+    entrypoint: str,
+    *,
+    base_dir: Path | None = None,
+) -> MetricCatalog:
+    """Load a MetricCatalog from ``python.module.path:attribute`` or module.
+
+    Supported shapes:
+    - ``metrics.catalog:catalog`` → attribute ``catalog`` on module
+    - ``metrics.catalog`` → ``build_catalog()`` or ``CATALOG`` on module
+    """
+    _ensure_sys_path(base_dir)
+    module_path, _, raw_attr = entrypoint.partition(":")
+    module_path = module_path.strip()
+    attr: str | None = raw_attr.strip() or None
+    if not module_path:
+        raise ConfigurationError(f"Invalid catalog entrypoint: {entrypoint!r}")
+
+    try:
+        module = importlib.import_module(module_path)
+    except Exception as exc:  # noqa: BLE001
+        raise ConfigurationError(f"Cannot import catalog module {module_path!r}: {exc}") from exc
+
+    if attr:
+        if not hasattr(module, attr):
+            raise ConfigurationError(
+                f"Catalog entrypoint {entrypoint!r}: attribute {attr!r} not found "
+                f"on module {module_path!r}"
+            )
+        return _coerce_catalog(getattr(module, attr), source=entrypoint)
+
+    if hasattr(module, "build_catalog"):
+        return _coerce_catalog(module.build_catalog(), source=f"{module_path}.build_catalog()")
+    if hasattr(module, "CATALOG"):
+        return _coerce_catalog(module.CATALOG, source=f"{module_path}.CATALOG")
+    if hasattr(module, "catalog"):
+        return _coerce_catalog(module.catalog, source=f"{module_path}.catalog")
+    raise ConfigurationError(
+        f"Catalog module {module_path!r} must expose build_catalog(), CATALOG, "
+        "catalog, or use entrypoint form 'module.path:attribute'"
+    )
+
+
+def _load_catalog_from_module(
+    module_path: str,
+    *,
+    base_dir: Path | None = None,
+) -> MetricCatalog:
+    """Back-compat wrapper — prefer :func:`load_catalog_entrypoint`."""
+    return load_catalog_entrypoint(module_path, base_dir=base_dir)
 
 
 def resolve_profile(
@@ -121,7 +167,7 @@ def build_runtime(
     *,
     project_config: str | Path | None = None,
     connections_config: str | Path | None = None,
-    catalog: KPICatalog | dict[str, KPI] | list[KPI] | None = None,
+    catalog: MetricCatalog | dict[str, Metric] | list[Metric] | None = None,
     start: Path | None = None,
 ) -> KPIEngine:
     project, project_path = load_project_config(project_config, start=start)
@@ -134,13 +180,11 @@ def build_runtime(
     )
 
     if catalog is None:
-        if project.catalog.module:
-            catalog = _load_catalog_from_module(
-                project.catalog.module,
-                base_dir=base_dir,
-            )
+        entrypoint = project.catalog.entrypoint or project.catalog.module
+        if entrypoint:
+            catalog = load_catalog_entrypoint(entrypoint, base_dir=base_dir)
         else:
-            catalog = KPICatalog([])
+            catalog = MetricCatalog([])
 
     executor = None
     if profile_cfg.metric_source:
@@ -211,3 +255,17 @@ def show_resolved_config(
             name: cfg.model_dump(mode="json") for name, cfg in connections.profiles.items()
         },
     }
+
+
+# Re-export for callers still typing KPICatalog / KPI.
+__all__ = [
+    "KPI",
+    "KPICatalog",
+    "Metric",
+    "MetricCatalog",
+    "build_runtime",
+    "load_catalog_entrypoint",
+    "resolve_profile",
+    "show_resolved_config",
+    "state_policy_from_project",
+]

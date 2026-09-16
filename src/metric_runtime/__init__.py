@@ -1,4 +1,4 @@
-"""metric-runtime — executable semantics for business metrics."""
+"""metric-runtime — define, validate, execute and operationalize semantic metrics."""
 
 from __future__ import annotations
 
@@ -11,7 +11,12 @@ from metric_runtime.calculations import (
     FormulaCalculation,
     SqlCalculation,
 )
-from metric_runtime.catalog import KPICatalog
+from metric_runtime.catalog import (
+    KPICatalog,
+    MetricCatalog,
+    MetricCatalogDiff,
+    MetricCatalogSnapshot,
+)
 from metric_runtime.detectors import (
     SeasonalZScore,
     SeasonalZScoreDetector,
@@ -20,6 +25,7 @@ from metric_runtime.detectors import (
 )
 from metric_runtime.engine import KPIEngine
 from metric_runtime.identity import EvaluationKey
+from metric_runtime.ids import MetricId
 from metric_runtime.incidents import open_smart_incident
 from metric_runtime.investigation import investigate_metric, investigate_window
 from metric_runtime.models import (
@@ -33,6 +39,7 @@ from metric_runtime.models import (
     KPIObservation,
     KPIState,
     KPIStatus,
+    Metric,
     MetricStateRecord,
     OutboxEvent,
     ProcessResult,
@@ -44,8 +51,15 @@ from metric_runtime.presentation import (
 )
 from metric_runtime.state import KPIStateTransition, StatePolicy
 from metric_runtime.stores import InMemoryStateStore
+from metric_runtime.units import UnitSpec
 
 __all__ = [
+    "Metric",
+    "MetricCatalog",
+    "MetricCatalogDiff",
+    "MetricCatalogSnapshot",
+    "MetricId",
+    "UnitSpec",
     "KPI",
     "KPICatalog",
     "KPIEngine",
@@ -84,4 +98,4 @@ __all__ = [
     "open_smart_incident",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
