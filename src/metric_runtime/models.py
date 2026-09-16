@@ -167,7 +167,7 @@ class KPI(BaseModel):
     """Executable semantic object for a business metric.
 
     A KPI says what the metric means. The runtime profile says where it
-    is evaluated.
+    is evaluated. ``calculation`` defines how the value is obtained.
 
     Presentation / layout hints belong in ``metadata`` (or the example
     layer), not as first-class core fields.
@@ -177,6 +177,10 @@ class KPI(BaseModel):
     label: str | None = None
     description: str = ""
     owner: str = ""
+    calculation: Any = Field(
+        default=None,
+        description="Discriminated Formula|SQL|Batch|Derived calculation",
+    )
     formula: Formula | None = None
     dimensions: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
@@ -196,10 +200,28 @@ class KPI(BaseModel):
 
         return coerce_detector_spec(value)
 
+    @field_validator("calculation", mode="before")
+    @classmethod
+    def _coerce_calculation(cls, value: Any) -> Any:
+        from metric_runtime.calculations.specs import coerce_calculation
+
+        return coerce_calculation(value)
+
     @model_validator(mode="after")
     def _defaults(self) -> KPI:
+        from metric_runtime.calculations.specs import FormulaCalculation
+
         if self.label is None:
             object.__setattr__(self, "label", self.name.replace("_", " ").title())
+
+        # Canonicalize: calculation is authoritative; formula is sugar.
+        if self.calculation is None and self.formula is not None:
+            object.__setattr__(self, "calculation", FormulaCalculation(formula=self.formula))
+        elif isinstance(self.calculation, FormulaCalculation):
+            if self.formula is None:
+                object.__setattr__(self, "formula", self.calculation.formula)
+            elif self.formula != self.calculation.formula:
+                raise ValueError(f"KPI {self.name!r}: formula and calculation.formula disagree")
         return self
 
     @property
@@ -221,6 +243,10 @@ class KPIObservation(BaseModel):
 
     Detection asks whether something is unusual.
     An observation alone is not an alert.
+
+    ``value_status`` distinguishes a numeric VALUE from NO_DATA / ERROR.
+    When status is not VALUE, ``value`` is a placeholder (0.0) and must not be
+    treated as a measured zero unless the KPI explicitly says so.
     """
 
     name: str
@@ -230,11 +256,17 @@ class KPIObservation(BaseModel):
     as_of: datetime
     filters: dict[str, str] = Field(default_factory=dict)
     baseline_values: list[float] = Field(default_factory=list)
+    value_status: str = "value"
+    calculation_error: str | None = None
 
     @field_validator("as_of", mode="before")
     @classmethod
     def _coerce_as_of(cls, value: Any) -> datetime:
         return parse_datetime(value)
+
+    @property
+    def has_value(self) -> bool:
+        return self.value_status == "value"
 
 
 class Detection(BaseModel):

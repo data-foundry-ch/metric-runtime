@@ -54,7 +54,34 @@ class KPICatalog:
         if not nx.is_directed_acyclic_graph(graph):
             cycles = list(nx.simple_cycles(graph))
             raise DependencyCycleError(f"KPI dependency graph contains cycle(s): {cycles[:3]}")
+
+        self._validate_derived_calculations(by_name)
         return by_name
+
+    @staticmethod
+    def _validate_derived_calculations(by_name: dict[str, KPI]) -> None:
+        from metric_runtime.calculations.expressions import expression_identifiers
+        from metric_runtime.calculations.specs import DerivedCalculation, FormulaCalculation
+
+        for metric in by_name.values():
+            calc = metric.calculation
+            if calc is None and metric.formula is not None:
+                calc = FormulaCalculation(formula=metric.formula)
+            if not isinstance(calc, DerivedCalculation):
+                continue
+            ids = expression_identifiers(calc.expression)
+            declared = set(metric.dependencies)
+            if not ids.issubset(declared):
+                raise InvalidMetricDefinitionError(
+                    f"KPI {metric.name!r} derived expression references "
+                    f"{sorted(ids - declared)} which are not declared in dependencies"
+                )
+            for ident in ids:
+                if ident not in by_name:
+                    raise UnknownMetricError(
+                        f"KPI {metric.name!r} derived expression references "
+                        f"unknown metric {ident!r}"
+                    )
 
     def get(self, name: str) -> KPI:
         try:

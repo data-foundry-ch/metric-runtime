@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from metric_runtime.calculations import (
+    BatchCalculation,
+    BatchRegistry,
+    DerivedCalculation,
+    EvaluationContext,
+    EvaluationSession,
+    FormulaCalculation,
+    SqlCalculation,
+)
 from metric_runtime.catalog import KPICatalog
 from metric_runtime.detectors import (
     SeasonalZScore,
@@ -39,9 +48,15 @@ __all__ = [
     "KPIState",
     "KPIStateTransition",
     "KPIStatus",
+    "BatchCalculation",
+    "BatchRegistry",
+    "DerivedCalculation",
     "Detection",
+    "EvaluationContext",
     "EvaluationKey",
     "EvaluationRecord",
+    "EvaluationSession",
+    "FormulaCalculation",
     "Incident",
     "InvestigationResult",
     "MetricStateRecord",
@@ -49,6 +64,7 @@ __all__ = [
     "ProcessResult",
     "Directionality",
     "Formula",
+    "SqlCalculation",
     "SeasonalZScore",
     "SeasonalZScoreDetector",
     "Threshold",

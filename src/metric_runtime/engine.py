@@ -72,6 +72,7 @@ class KPIEngine:
         fact_table: str | None = None,
         state_policy: StatePolicy | None = None,
         preferred_leaves: tuple[str, ...] = (),
+        batch_registry=None,
     ):
         if isinstance(catalog, KPICatalog):
             self._catalog = catalog
@@ -95,6 +96,7 @@ class KPIEngine:
         self.notifier = notifier or NullNotifier()
         self.state_policy = state_policy or StatePolicy()
         self.preferred_leaves = preferred_leaves
+        self.batch_registry = batch_registry
 
         # Convenience attributes used by example quality helpers.
         self.fact_table = getattr(executor, "fact_table", fact_table)
@@ -145,6 +147,22 @@ class KPIEngine:
         except UnknownMetricError:
             raise
 
+    def new_evaluation_session(self):
+        """Create a fresh EvaluationSession (session-local batch cache)."""
+        from metric_runtime.calculations.batch import BatchRegistry
+        from metric_runtime.calculations.session import EvaluationSession
+
+        return EvaluationSession(
+            self._catalog,
+            executor=self.executor,
+            batch_registry=self.batch_registry or BatchRegistry(),
+        )
+
+    @property
+    def evaluation_session(self):
+        """Compatibility alias — prefer ``new_evaluation_session()`` for isolation."""
+        return self.new_evaluation_session()
+
     def metric_value(
         self,
         metric_name: str,
@@ -153,12 +171,17 @@ class KPIEngine:
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> float:
-        metric = self._get_kpi(metric_name)
-        if metric.formula is None:
-            raise MetricRuntimeError(f"KPI {metric_name!r} has no formula for execution")
-        return self._require_executor().metric_value(
-            metric.formula, at=at, filters=filters, start=start, end=end
-        )
+        from metric_runtime.calculations.context import ObservationValueStatus
+        from metric_runtime.calculations.session import build_evaluation_context
+
+        context = build_evaluation_context(at=at, start=start, end=end, filters=filters)
+        result = self.new_evaluation_session().calculate_value(metric_name, context)
+        if result.status != ObservationValueStatus.VALUE or result.value is None:
+            raise MetricRuntimeError(
+                f"KPI {metric_name!r} produced {result.status.value}"
+                + (f": {result.error}" if result.error else " (no data)")
+            )
+        return float(result.value)
 
     def measure_value(
         self,

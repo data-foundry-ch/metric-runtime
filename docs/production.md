@@ -30,7 +30,9 @@ runtime worker
         ↓
 claim EvaluationKey
         ↓
-calculate (observation / detector / state / investigation)
+EvaluationSession (formula / SQL / batch / derived)
+        ↓
+observation
         ↓
 atomic DB transaction
         ├── observation
@@ -44,6 +46,22 @@ separate delivery worker
         ↓
 Slack / Teams / email / webhook
 ```
+
+Batch calculations allow related KPI observations to **share computation**
+within one evaluation session. They do not make warehouse compute free.
+
+Warehouse / lake
+      ↓
+Executor
+      ↓
+EvaluationSession
+      ├── SQL calculations
+      ├── shared batch calculations
+      └── derived calculations
+      ↓
+Observations
+      ↓
+existing state runtime
 
 A future Postgres adapter can implement both:
 

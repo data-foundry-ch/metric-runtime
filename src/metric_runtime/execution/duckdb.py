@@ -268,3 +268,98 @@ class DuckDBExecutor:
             [_bind_timestamp(at)],
         ).fetchone()
         return int(row[0] or 0)
+
+    # --- SQL calculation interface (scalar / named-row) ---
+
+    sql_dialects = frozenset({"duckdb"})
+
+    def execute_scalar(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        dialect: str | None = None,
+        value_column: str = "value",
+    ) -> float | None:
+        """Execute parameterized SQL expecting exactly one row with ``value_column``."""
+        self._assert_sql_dialect(dialect)
+        sql, params = _normalize_sql_params(query, parameters or {})
+        try:
+            cursor = self.con.execute(sql, params)
+        except Exception as exc:  # noqa: BLE001
+            raise MetricRuntimeError(f"SQL execution failed: {exc}") from exc
+        description = cursor.description or []
+        columns = [col[0] for col in description]
+        rows = cursor.fetchall()
+        if len(rows) == 0:
+            return None
+        if len(rows) > 1:
+            raise MetricRuntimeError(f"SQL calculation expected exactly one row, got {len(rows)}")
+        if value_column not in columns:
+            raise MetricRuntimeError(
+                f"SQL calculation result missing column {value_column!r}; got columns {columns}"
+            )
+        idx = columns.index(value_column)
+        raw = rows[0][idx]
+        if raw is None:
+            return None
+        return float(raw)
+
+    def execute_named_row(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        dialect: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute parameterized SQL expecting exactly one row of named columns."""
+        self._assert_sql_dialect(dialect)
+        sql, params = _normalize_sql_params(query, parameters or {})
+        try:
+            cursor = self.con.execute(sql, params)
+        except Exception as exc:  # noqa: BLE001
+            raise MetricRuntimeError(f"SQL execution failed: {exc}") from exc
+        description = cursor.description or []
+        columns = [col[0] for col in description]
+        rows = cursor.fetchall()
+        if len(rows) == 0:
+            raise MetricRuntimeError("SQL batch source returned zero rows")
+        if len(rows) > 1:
+            raise MetricRuntimeError(f"SQL batch source expected exactly one row, got {len(rows)}")
+        return dict(zip(columns, rows[0], strict=False))
+
+    def _assert_sql_dialect(self, dialect: str | None) -> None:
+        if dialect is None:
+            return
+        if dialect not in self.sql_dialects:
+            raise MetricRuntimeError(
+                f"DuckDBExecutor does not support dialect {dialect!r} "
+                f"(supports {sorted(self.sql_dialects)}). "
+                "Metric Runtime does not transpile SQL across warehouses."
+            )
+
+
+_PARAM_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _normalize_sql_params(
+    query: str,
+    parameters: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Translate ``:name`` placeholders to DuckDB ``$name`` and bind values.
+
+    Only parameters referenced by the query are bound — DuckDB rejects excess
+    named parameters.
+    """
+    names = list(dict.fromkeys(_PARAM_RE.findall(query)))
+    sql = _PARAM_RE.sub(r"$\1", query)
+    bound: dict[str, Any] = {}
+    for name in names:
+        if name not in parameters:
+            raise MetricRuntimeError(f"Missing SQL parameter: {name!r}")
+        value = parameters[name]
+        if isinstance(value, datetime):
+            bound[name] = _bind_timestamp(value)
+        else:
+            bound[name] = value
+    return sql, bound
