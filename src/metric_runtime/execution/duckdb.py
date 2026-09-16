@@ -75,25 +75,24 @@ def _require_duckdb() -> Any:
 
 
 class DuckDBExecutor:
-    """Evaluate KPI formulas against a DuckDB database or connection."""
+    """Evaluate KPI formulas and SQL against a DuckDB database or connection.
+
+    ``fact_table`` is required for formula/measure aggregation against a
+    designated fact relation. Omit it for SQL/batch-only sessions.
+    """
 
     def __init__(
         self,
         path_or_connection: str | Path | Any,
         *,
-        fact_table: str,
+        fact_table: str | None = None,
         read_only: bool = True,
         valid_dimensions: set[str] | None = None,
         timestamp_column: str = "ts",
     ) -> None:
-        if not fact_table:
-            raise MetricRuntimeError(
-                "DuckDBExecutor requires an explicit fact_table "
-                "(set it in connections.yaml or pass fact_table=...)."
-            )
         duckdb = _require_duckdb()
         self.fact_table = fact_table
-        self._fact_sql = quote_relation(fact_table)
+        self._fact_sql = quote_relation(fact_table) if fact_table else None
         self._ts_sql = quote_identifier(timestamp_column)
         # None = do not restrict filter/dimension keys (catalog owns validity).
         self.valid_dimensions = valid_dimensions
@@ -105,6 +104,14 @@ class DuckDBExecutor:
         else:
             self.con = duckdb.connect(str(path_or_connection), read_only=read_only)
             self._owns_connection = True
+
+    def _require_fact_table_sql(self) -> str:
+        if self._fact_sql is None:
+            raise MetricRuntimeError(
+                "DuckDBExecutor requires fact_table for formula/measure evaluation; "
+                "omit it only for SQL/batch-only sessions."
+            )
+        return self._fact_sql
 
     def close(self) -> None:
         if self._owns_connection and self.con is not None:
@@ -187,10 +194,11 @@ class DuckDBExecutor:
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> float:
+        fact_sql = self._require_fact_table_sql()
         where, params = self._where_clause(at, filters, start, end)
         sql = f"""
             SELECT {self._metric_sql(formula)} AS value
-            FROM {self._fact_sql}
+            FROM {fact_sql}
             WHERE {where}
         """
         value = self.con.execute(sql, params).fetchone()[0]
@@ -205,11 +213,12 @@ class DuckDBExecutor:
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> float:
+        fact_sql = self._require_fact_table_sql()
         column = quote_identifier(coerce_measure_ref(measure))
         where, params = self._where_clause(at, filters, start, end)
         sql = f"""
             SELECT SUM({column})::DOUBLE
-            FROM {self._fact_sql}
+            FROM {fact_sql}
             WHERE {where}
         """
         value = self.con.execute(sql, params).fetchone()[0]
@@ -237,10 +246,11 @@ class DuckDBExecutor:
         where, params = self._where_clause(at, filters, start, end, valid_dimensions=allowed)
         quoted = [quote_identifier(d) for d in dimensions]
         columns = ", ".join(quoted)
+        fact_sql = self._require_fact_table_sql()
         rows = self.con.execute(
             f"""
             SELECT DISTINCT {columns}
-            FROM {self._fact_sql}
+            FROM {fact_sql}
             WHERE {where}
             ORDER BY {columns}
             """,
@@ -253,18 +263,115 @@ class DuckDBExecutor:
         ]
 
     def latest_timestamp(self) -> datetime | None:
-        latest = self.con.execute(f"SELECT MAX({self._ts_sql}) FROM {self._fact_sql}").fetchone()[0]
+        fact_sql = self._require_fact_table_sql()
+        latest = self.con.execute(f"SELECT MAX({self._ts_sql}) FROM {fact_sql}").fetchone()[0]
         if latest is None:
             return None
         return _from_duckdb_timestamp(latest)
 
     def row_count_at(self, at: datetime) -> int:
+        fact_sql = self._require_fact_table_sql()
         row = self.con.execute(
             f"""
             SELECT COUNT(*)::INTEGER
-            FROM {self._fact_sql}
+            FROM {fact_sql}
             WHERE {self._ts_sql} = ?
             """,
             [_bind_timestamp(at)],
         ).fetchone()
         return int(row[0] or 0)
+
+    # --- SQL calculation interface (scalar / named-row) ---
+
+    sql_dialects = frozenset({"duckdb"})
+
+    def execute_scalar(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        dialect: str | None = None,
+        value_column: str = "value",
+    ) -> float | None:
+        """Execute parameterized SQL expecting exactly one row with ``value_column``."""
+        self._assert_sql_dialect(dialect)
+        sql, params = _normalize_sql_params(query, parameters or {})
+        try:
+            cursor = self.con.execute(sql, params)
+        except Exception as exc:  # noqa: BLE001
+            raise MetricRuntimeError(f"SQL execution failed: {exc}") from exc
+        description = cursor.description or []
+        columns = [col[0] for col in description]
+        rows = cursor.fetchall()
+        if len(rows) == 0:
+            return None
+        if len(rows) > 1:
+            raise MetricRuntimeError(f"SQL calculation expected exactly one row, got {len(rows)}")
+        if value_column not in columns:
+            raise MetricRuntimeError(
+                f"SQL calculation result missing column {value_column!r}; got columns {columns}"
+            )
+        idx = columns.index(value_column)
+        raw = rows[0][idx]
+        if raw is None:
+            return None
+        return float(raw)
+
+    def execute_named_row(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        dialect: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute parameterized SQL expecting exactly one row of named columns."""
+        self._assert_sql_dialect(dialect)
+        sql, params = _normalize_sql_params(query, parameters or {})
+        try:
+            cursor = self.con.execute(sql, params)
+        except Exception as exc:  # noqa: BLE001
+            raise MetricRuntimeError(f"SQL execution failed: {exc}") from exc
+        description = cursor.description or []
+        columns = [col[0] for col in description]
+        rows = cursor.fetchall()
+        if len(rows) == 0:
+            raise MetricRuntimeError("SQL batch source returned zero rows")
+        if len(rows) > 1:
+            raise MetricRuntimeError(f"SQL batch source expected exactly one row, got {len(rows)}")
+        return dict(zip(columns, rows[0], strict=False))
+
+    def _assert_sql_dialect(self, dialect: str | None) -> None:
+        if dialect is None:
+            return
+        if dialect not in self.sql_dialects:
+            raise MetricRuntimeError(
+                f"DuckDBExecutor does not support dialect {dialect!r} "
+                f"(supports {sorted(self.sql_dialects)}). "
+                "Metric Runtime does not transpile SQL across warehouses."
+            )
+
+
+_PARAM_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _normalize_sql_params(
+    query: str,
+    parameters: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Translate ``:name`` placeholders to DuckDB ``$name`` and bind values.
+
+    Only parameters referenced by the query are bound — DuckDB rejects excess
+    named parameters.
+    """
+    names = list(dict.fromkeys(_PARAM_RE.findall(query)))
+    sql = _PARAM_RE.sub(r"$\1", query)
+    bound: dict[str, Any] = {}
+    for name in names:
+        if name not in parameters:
+            raise MetricRuntimeError(f"Missing SQL parameter: {name!r}")
+        value = parameters[name]
+        if isinstance(value, datetime):
+            bound[name] = _bind_timestamp(value)
+        else:
+            bound[name] = value
+    return sql, bound

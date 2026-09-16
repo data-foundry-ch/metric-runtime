@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from metric_runtime.calculations import (
+    BatchCalculation,
+    BatchRegistry,
+    DerivedCalculation,
+    EvaluationContext,
+    EvaluationSession,
+    FormulaCalculation,
+    SqlCalculation,
+)
 from metric_runtime.catalog import KPICatalog
 from metric_runtime.detectors import (
     SeasonalZScore,
@@ -28,6 +37,11 @@ from metric_runtime.models import (
     OutboxEvent,
     ProcessResult,
 )
+from metric_runtime.presentation import (
+    PresentationBand,
+    PresentationThreshold,
+    classify_presentation_band,
+)
 from metric_runtime.state import KPIStateTransition, StatePolicy
 from metric_runtime.stores import InMemoryStateStore
 
@@ -39,22 +53,32 @@ __all__ = [
     "KPIState",
     "KPIStateTransition",
     "KPIStatus",
+    "BatchCalculation",
+    "BatchRegistry",
+    "DerivedCalculation",
     "Detection",
+    "EvaluationContext",
     "EvaluationKey",
     "EvaluationRecord",
+    "EvaluationSession",
+    "FormulaCalculation",
     "Incident",
     "InvestigationResult",
     "MetricStateRecord",
     "OutboxEvent",
+    "PresentationBand",
+    "PresentationThreshold",
     "ProcessResult",
     "Directionality",
     "Formula",
+    "SqlCalculation",
     "SeasonalZScore",
     "SeasonalZScoreDetector",
     "Threshold",
     "ThresholdDetector",
     "InMemoryStateStore",
     "StatePolicy",
+    "classify_presentation_band",
     "investigate_metric",
     "investigate_window",
     "open_smart_incident",

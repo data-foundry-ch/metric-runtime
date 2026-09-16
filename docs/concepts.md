@@ -29,6 +29,12 @@ State determines whether the organization should care yet.
 
 **An anomaly is not an alert.**
 
+For product embedders: observation `value_status` (`value` / `no_data` /
+`error`) is distinct from detector/state. Prefer `KPIObservation.measured_value`
+(`float | None`) so NO_DATA/ERROR are not shown as zero. Optional presentation
+bands (`classify_presentation_band`) are display policy only — detectors remain
+authoritative for ops.
+
 ## Portable semantics
 
 Independently versionable concerns:

@@ -167,16 +167,21 @@ class KPI(BaseModel):
     """Executable semantic object for a business metric.
 
     A KPI says what the metric means. The runtime profile says where it
-    is evaluated.
+    is evaluated. ``calculation`` defines how the value is obtained.
 
-    Presentation / layout hints belong in ``metadata`` (or the example
-    layer), not as first-class core fields.
+    Display fields for embedders: ``label``, ``unit``, ``format``.
+    Layout hints (parent / ring / order) belong in ``metadata`` (or the
+    product layer), not as first-class core fields.
     """
 
     name: str
     label: str | None = None
     description: str = ""
     owner: str = ""
+    calculation: Any = Field(
+        default=None,
+        description="Discriminated Formula|SQL|Batch|Derived calculation",
+    )
     formula: Formula | None = None
     dimensions: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
@@ -187,6 +192,10 @@ class KPI(BaseModel):
     support: SupportRequirement | None = None
     impact: ImpactModel = Field(default_factory=ImpactModel)
     unit: Literal["count", "ratio", "eur", "percent", "unit"] = "unit"
+    format: str | None = Field(
+        default=None,
+        description="Optional display format hint for embedders (e.g. '0.0%', '#,##0').",
+    )
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("detector", mode="before")
@@ -196,18 +205,48 @@ class KPI(BaseModel):
 
         return coerce_detector_spec(value)
 
+    @field_validator("calculation", mode="before")
+    @classmethod
+    def _coerce_calculation(cls, value: Any) -> Any:
+        from metric_runtime.calculations.specs import coerce_calculation
+
+        return coerce_calculation(value)
+
     @model_validator(mode="after")
     def _defaults(self) -> KPI:
+        from metric_runtime.calculations.specs import FormulaCalculation
+
         if self.label is None:
             object.__setattr__(self, "label", self.name.replace("_", " ").title())
+
+        # Canonicalize: calculation is authoritative; formula is sugar.
+        if self.calculation is None and self.formula is not None:
+            object.__setattr__(self, "calculation", FormulaCalculation(formula=self.formula))
+        elif isinstance(self.calculation, FormulaCalculation):
+            if self.formula is None:
+                object.__setattr__(self, "formula", self.calculation.formula)
+            elif self.formula != self.calculation.formula:
+                raise ValueError(f"KPI {self.name!r}: formula and calculation.formula disagree")
         return self
 
     @property
     def display_name(self) -> str:
         return self.label or self.name
 
+    def display(self) -> dict[str, Any]:
+        """Product display hints: label / unit / format (not layout)."""
+        return {
+            "label": self.display_name,
+            "unit": self.unit,
+            "format": self.format,
+        }
+
     def presentation(self) -> dict[str, Any]:
-        """Optional example/presentation hints stored under metadata."""
+        """Optional layout/example hints stored under metadata['presentation'].
+
+        Prefer ``display()`` for unit/label/format. Keep graph parent/ring/order
+        in metadata — not first-class core fields.
+        """
         raw = self.metadata.get("presentation")
         return dict(raw) if isinstance(raw, dict) else {}
 
@@ -221,6 +260,18 @@ class KPIObservation(BaseModel):
 
     Detection asks whether something is unusual.
     An observation alone is not an alert.
+
+    Null semantics for embedders / UI bridges:
+
+    - ``value_status == "value"``: ``value`` is a real measurement (including
+      legitimate ``0.0``). Use ``measured_value`` / ``has_value``.
+    - ``value_status == "no_data"``: no row / NULL / missing deps — ``value``
+      is a placeholder ``0.0`` and **must not** be shown as zero.
+    - ``value_status == "error"``: calculation failed — see
+      ``calculation_error``; ``value`` is again a placeholder ``0.0``.
+
+    Prefer ``measured_value`` (``float | None``) when bridging to nullable UI
+    fields so NO_DATA/ERROR do not look like a measured zero.
     """
 
     name: str
@@ -230,11 +281,30 @@ class KPIObservation(BaseModel):
     as_of: datetime
     filters: dict[str, str] = Field(default_factory=dict)
     baseline_values: list[float] = Field(default_factory=list)
+    value_status: str = "value"
+    calculation_error: str | None = None
 
     @field_validator("as_of", mode="before")
     @classmethod
     def _coerce_as_of(cls, value: Any) -> datetime:
         return parse_datetime(value)
+
+    @property
+    def has_value(self) -> bool:
+        return self.value_status == "value"
+
+    @property
+    def measured_value(self) -> float | None:
+        """Nullable measurement for UI bridges; ``None`` when NO_DATA/ERROR."""
+        return self.value if self.has_value else None
+
+    @property
+    def is_no_data(self) -> bool:
+        return self.value_status == "no_data"
+
+    @property
+    def is_error(self) -> bool:
+        return self.value_status == "error"
 
 
 class Detection(BaseModel):

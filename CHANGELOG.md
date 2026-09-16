@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Executable Pydantic KPI semantic model (`KPI`)
 - Generic measure references + `Formula.sum` / `Formula.ratio` / `Formula.difference`
+- First-class ``Calculation`` model: ``FormulaCalculation``, ``SqlCalculation``, ``BatchCalculation``, ``DerivedCalculation``
+- ``SqlCalculation.bindings`` / ``SqlBatchSource.bindings`` for KPI-local SQL parameters (request context overrides)
+- Optional ``DuckDBExecutor(fact_table=None)`` for SQL/batch-only sessions
+- ``EvaluationContext`` + ``EvaluationSession`` for catalog-level calculation orchestration
+- Shared ``BatchRegistry`` / ``SqlBatchSource`` / ``CallableBatchSource``
+- Safe derived expression language (AST whitelist)
+- Domain-neutral ``examples/sql_catalog`` demo
+- Docs: ``docs/calculations.md``, ADR ``0001-first-class-calculations``
+- ``PresentationThreshold`` + ``classify_presentation_band`` (presentation policy only; not detectors/alerts)
+- Optional KPI ``format`` display hint; ``KPI.display()`` for label/unit/format
+- ``EvaluationContext`` binding alias ``as_of_date`` (= ``effective_at``)
+- ``KPICatalog`` JSON Schema + JSON/JSONL export/import (calculations included)
+- ``KPIObservation.measured_value`` / ``is_no_data`` / ``is_error`` for nullable UI bridges
 - Per-KPI detector specs (`SeasonalZScore`, `Threshold`) with engine-level runtime default
 - `KPICatalog` with dependency and cycle validation
 - Pluggable runtime detectors (`SeasonalZScoreDetector`, `ThresholdDetector`)
@@ -19,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Semantic dependency graph (NetworkX) and graph-aware investigation
 - Incident model with ownership routing helpers
 - In-memory state store and notifier extension points
-- Optional DuckDB execution backend (schema-agnostic; explicit `fact_table`)
+- Optional DuckDB execution backend (schema-agnostic; ``fact_table`` required only for formula/measure paths)
 - Project/connections configuration (`metric-runtime.yaml` + `connections.yaml`)
 - Small CLI (`validate`, `config show`, `run`, `connections test`)
 - PyPizza / Great Lunch flagship example (domain measures live under `examples/pypizza/`)
@@ -54,3 +67,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``StaleEvaluationError`` when an older window would overwrite newer state
 - Outbox ``state_changed`` only when an incident payload exists (notifier contract)
 - Deprecated legacy store helpers: ``append_observation``, ``has_observation``, ``set_state``
+- ``KPI.calculation`` is the canonical calculation field; ``formula=`` remains sugar that normalizes to ``FormulaCalculation``

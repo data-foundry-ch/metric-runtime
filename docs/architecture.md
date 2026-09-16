@@ -3,34 +3,72 @@
 metric-runtime turns business metrics into executable semantic objects.
 
 ```
-Metric semantics
-      ↓
-Observation
-      ↓
-Detection
-      ↓
-State transition
-      ↓
-Dependency traversal
-      ↓
-Incident
-      ↓
-Action
+Catalog
+│
+├── KPI semantics (owner, deps, detector, …)
+│
+└── Calculation specs
+        │
+        ▼
+EvaluationSession / planner
+│
+├── Formula
+├── SQL
+├── Batch (shared)
+└── Derived
+        │
+        ▼
+Executor(s)
+        │
+        ▼
+KPIObservation
+        │
+        ▼
+Runtime lifecycle
+│
+├── Detector
+├── Ordered metric/scope state
+├── Graph investigation
+├── Incident
+└── Outbox
 ```
+
+## Layer ownership
+
+| Layer | Owns |
+|---|---|
+| Metric Runtime | calculation contracts, evaluation orchestration, observation creation, state lifecycle |
+| Executor | connection-specific mechanics (DuckDB SQL binding, fact-table aggregates) |
+| Application | domain SQL, batch registrations, catalog definitions |
+
+## Business graph vs execution graph
+
+**Semantic / business graph** (`KPI.dependencies`): explanatory relationships for
+investigation and ownership routing.
+
+**Execution grouping** (batch sources): shared computation for efficiency.
+
+These are different graphs. Do not merge them.
+
+See also [calculations.md](calculations.md) and
+[ADR 0001](adr/0001-first-class-calculations.md).
 
 ## 1. Semantic model
 
-A `KPI` describes **what a metric means**: formula intent, dependencies,
+A `KPI` describes **what a metric means**: calculation, dependencies,
 dimensions, ownership, directionality, detector policy, and support rules.
 
 KPI definitions do **not** contain database credentials or infrastructure details.
 
 ## 2. Metric execution
 
-A `MetricExecutor` calculates observations from a resource.
+A `MetricExecutor` calculates formula observations from a resource.
+SQL/batch calculations use the executor's scalar/row SQL interface when present.
 
-`DuckDBExecutor` is the v0.1 analytical backend. Future backends (Snowflake,
-BigQuery, …) should plug in without changing KPI semantics.
+`DuckDBExecutor` is the v0.1 analytical backend. It can run SQL/batch-only
+sessions without a designated `fact_table`; formula/measure aggregation still
+requires one. Future backends (Snowflake, BigQuery, …) should plug in without
+changing KPI semantics. Metric Runtime does **not** transpile SQL across dialects.
 
 ## 3. Observations
 

@@ -95,6 +95,59 @@ State determines whether the organization should care yet.
 Don't poll the whole business. Propagate change through it.
 Business semantics become software.
 
+## Four ways to calculate a KPI
+
+See [docs/calculations.md](docs/calculations.md) for the full guide.
+
+### Formula
+
+Simple aggregation over known fact-table measures:
+
+```python
+from metric_runtime.calculations import FormulaCalculation
+
+KPI(
+    name="orders",
+    calculation=FormulaCalculation(formula=Formula.sum("orders")),
+)
+```
+
+### SQL
+
+Arbitrary parameterized relational logic (no SQL transpilation):
+
+```python
+from metric_runtime.calculations import SqlCalculation
+
+KPI(
+    name="closed_won_revenue",
+    calculation=SqlCalculation(
+        dialect="duckdb",
+        query="SELECT SUM(amount) AS value FROM opportunity WHERE is_won AND close_date = :effective_at",
+    ),
+)
+```
+
+### Batch
+
+Many KPIs sharing one expensive query (execution optimization, not a semantic edge):
+
+```python
+from metric_runtime.calculations import BatchCalculation
+
+BatchCalculation(source="sales_metrics", result="pipeline_coverage")
+```
+
+### Derived
+
+Compute from already-evaluated KPIs with a safe expression language:
+
+```python
+from metric_runtime.calculations import DerivedCalculation
+
+DerivedCalculation(expression="closed_won_revenue / bookings_target")
+```
+
 The authoritative loop is ``KPIEngine.process`` (alias ``tick``):
 
 ```python
