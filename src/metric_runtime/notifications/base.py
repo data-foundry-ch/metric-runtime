@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from metric_runtime.models import Incident
+from metric_runtime.models import Incident, OutboxEvent
 
 
 @runtime_checkable
@@ -24,6 +24,18 @@ class Notifier(Protocol):
         *,
         idempotency_key: str | None = None,
     ) -> None: ...
+
+
+@runtime_checkable
+class EventNotifier(Protocol):
+    """Optional richer protocol: receive the whole outbox event.
+
+    Outbox delivery prefers ``notify_event`` when a notifier implements it, so
+    adapters also see the event kind, transition and stable ``event_key``.
+    Raising marks the attempt failed (retried with backoff).
+    """
+
+    def notify_event(self, event: OutboxEvent) -> None: ...
 
 
 class RecordingNotifier:

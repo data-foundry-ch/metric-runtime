@@ -8,6 +8,6 @@ COPY src ./src
 COPY examples ./examples
 COPY metric-runtime.yaml ./
 
-RUN pip install --no-cache-dir -e ".[demo]"
+RUN pip install --no-cache-dir -e ".[demo,postgres]"
 
 CMD ["metric-runtime", "--help"]

@@ -49,8 +49,9 @@ from metric_runtime.presentation import (
     PresentationThreshold,
     classify_presentation_band,
 )
+from metric_runtime.runtime import MetricRuntime, RunReport, RuntimeSchedule
 from metric_runtime.state import KPIStateTransition, StatePolicy
-from metric_runtime.stores import InMemoryStateStore
+from metric_runtime.stores import InMemoryRuntimeStore, InMemoryStateStore, RuntimeStore
 from metric_runtime.units import UnitSpec
 
 __all__ = [
@@ -78,6 +79,7 @@ __all__ = [
     "FormulaCalculation",
     "Incident",
     "InvestigationResult",
+    "MetricRuntime",
     "MetricStateRecord",
     "OutboxEvent",
     "PresentationBand",
@@ -90,7 +92,11 @@ __all__ = [
     "SeasonalZScoreDetector",
     "Threshold",
     "ThresholdDetector",
+    "InMemoryRuntimeStore",
     "InMemoryStateStore",
+    "RunReport",
+    "RuntimeSchedule",
+    "RuntimeStore",
     "StatePolicy",
     "classify_presentation_band",
     "investigate_metric",

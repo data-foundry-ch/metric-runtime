@@ -6,18 +6,17 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from metric_runtime.exceptions import (
     EvaluationInProgressError,
-    MetricRuntimeError,
+    NotificationLeaseLostError,
     StaleEvaluationError,
 )
 from metric_runtime.identity import EvaluationKey, canonical_scope_key, ensure_utc
 from metric_runtime.models import (
     EvaluationRecord,
     Incident,
-    IncidentState,
     KPIState,
     KPIStatus,
     MetricStateRecord,
@@ -25,184 +24,109 @@ from metric_runtime.models import (
     StoredObservation,
 )
 from metric_runtime.stores.base import EvaluationClaim, EvaluationClaimStatus
+from metric_runtime.stores.staging import (
+    ACTIVE_INCIDENT_STATES,
+    StagedTransaction,
+    latest_incident,
+)
 
-_ACTIVE_INCIDENT_STATES = {
-    IncidentState.OPEN,
-    IncidentState.DETECTED,
-    IncidentState.ACKNOWLEDGED,
-}
 
-
-class _InMemoryTransaction:
+class _InMemoryTransaction(StagedTransaction):
     """Stages mutations; commit applies them atomically under the store lock."""
 
-    def __init__(self, store: InMemoryStateStore) -> None:
+    def __init__(
+        self,
+        store: InMemoryStateStore,
+        *,
+        evaluation_key: EvaluationKey | None = None,
+        claim_token: str | None = None,
+    ) -> None:
+        super().__init__()
         self._store = store
-        self._obs: dict[str, StoredObservation] = {}
-        self._states: dict[tuple[str, str], MetricStateRecord] = {}
-        self._incidents: dict[str, Incident] = {}
-        self._outbox: dict[str, OutboxEvent] = {}
-        self._evaluations: dict[str, EvaluationRecord] = {}
-        self._history_adds: dict[tuple[str, str], list[str]] = {}
-        self._committed = False
-        self._rolled_back = False
+        self._evaluation_key = evaluation_key
+        self._claim_token = claim_token
         self._incident_seq_offset = 0
         self._outbox_seq_offset = 0
 
-    def get_observation(self, key: EvaluationKey) -> StoredObservation | None:
-        obs_id = InMemoryStateStore._obs_id(key)
-        if obs_id in self._obs:
-            return self._obs[obs_id]
+    def _committed_observation(self, key: EvaluationKey) -> StoredObservation | None:
         return self._store.get_observation(key)
 
-    def get_committed_result(self, key: EvaluationKey) -> EvaluationRecord | None:
-        identity = key.identity
-        if identity in self._evaluations:
-            return self._evaluations[identity]
+    def _committed_result(self, key: EvaluationKey) -> EvaluationRecord | None:
         return self._store.get_committed_result(key)
 
-    def get_history(self, metric: str, scope_key: str = "") -> list[StoredObservation]:
-        base = self._store.get_history(metric, scope_key)
-        by_id = {InMemoryStateStore._obs_id(item.key): item for item in base}
-        for obs_id, obs in self._obs.items():
-            if obs.key.metric == metric and obs.key.scope_key == scope_key:
-                by_id[obs_id] = obs
-        order = list(self._store._history.get((metric, scope_key), []))
-        for obs_id in self._history_adds.get((metric, scope_key), []):
-            if obs_id not in order:
-                order.append(obs_id)
-        return [by_id[obs_id] for obs_id in order if obs_id in by_id]
+    def _committed_history(self, metric: str, scope_key: str) -> list[StoredObservation]:
+        return self._store.get_history(metric, scope_key)
 
-    def get_state_record(self, metric: str, scope_key: str = "") -> MetricStateRecord:
-        staged = self._states.get((metric, scope_key))
-        if staged is not None:
-            return staged
+    def _committed_state(self, metric: str, scope_key: str) -> MetricStateRecord:
         return self._store.get_state_record(metric, scope_key)
 
-    def find_active_incident(self, metric: str, scope_key: str = "") -> Incident | None:
-        committed = {i.id: i for i in self._store.list_open_incidents() if i.id is not None}
-        for incident in self._incidents.values():
-            if incident.id is not None:
-                committed[incident.id] = incident
-        matches = [
-            i
-            for i in committed.values()
-            if i.primary_metric == metric
-            and canonical_scope_key(i.scope) == scope_key
-            and i.state in _ACTIVE_INCIDENT_STATES
-        ]
-        if not matches:
-            return None
+    def _committed_active_incidents(self, metric: str, scope_key: str) -> list[Incident]:
+        return self._store.list_open_incidents()
 
-        def _sort_key(i: Incident) -> str:
-            stamp = i.updated_at or i.opened_at or i.first_detected
-            return ensure_utc(stamp).isoformat()
-
-        matches.sort(key=_sort_key)
-        return matches[-1]
-
-    def get_incident(self, incident_id: str) -> Incident | None:
-        if incident_id in self._incidents:
-            return self._incidents[incident_id]
+    def _committed_incident(self, incident_id: str) -> Incident | None:
         return self._store.get_incident(incident_id)
 
-    def stage_observation(self, observation: StoredObservation) -> None:
-        self._ensure_open()
-        obs_id = InMemoryStateStore._obs_id(observation.key)
-        self._obs[obs_id] = observation
-        hist_key = (observation.key.metric, observation.key.scope_key)
-        self._history_adds.setdefault(hist_key, []).append(obs_id)
+    def _committed_notification_by_key(self, event_key: str) -> OutboxEvent | None:
+        existing_id = self._store._outbox_by_key.get(event_key)
+        if existing_id is None:
+            return None
+        return self._store._outbox.get(existing_id)
 
-    def stage_state_record(self, record: MetricStateRecord) -> None:
-        self._ensure_open()
-        self._states[(record.metric, record.scope_key)] = record
+    def _allocate_incident_id(self) -> str:
+        self._incident_seq_offset += 1
+        return f"inc-{self._store._incident_seq + self._incident_seq_offset:04d}"
 
-    def stage_incident(self, incident: Incident) -> Incident:
-        self._ensure_open()
-        if not incident.id:
-            self._incident_seq_offset += 1
-            next_id = self._store._incident_seq + self._incident_seq_offset
-            incident = incident.model_copy(update={"id": f"inc-{next_id:04d}"})
-        assert incident.id is not None
-        self._incidents[incident.id] = incident
-        return incident
+    def _allocate_outbox_id(self) -> str:
+        self._outbox_seq_offset += 1
+        return f"out-{self._store._outbox_seq + self._outbox_seq_offset:04d}"
 
-    def stage_notification(self, event: OutboxEvent) -> OutboxEvent:
-        self._ensure_open()
-        if event.event_key:
-            staged = next(
-                (e for e in self._outbox.values() if e.event_key == event.event_key),
-                None,
-            )
-            if staged is not None:
-                return staged
-            existing_id = self._store._outbox_by_key.get(event.event_key)
-            if existing_id is not None:
-                existing = self._store._outbox.get(existing_id)
-                if existing is not None:
-                    return existing
-        if not event.id:
-            self._outbox_seq_offset += 1
-            next_id = self._store._outbox_seq + self._outbox_seq_offset
-            event = event.model_copy(update={"id": f"out-{next_id:04d}"})
-        assert event.id is not None
-        self._outbox[event.id] = event
-        return event
-
-    def stage_evaluation_record(self, record: EvaluationRecord) -> None:
-        self._ensure_open()
-        self._evaluations[record.key.identity] = record
-
-    def commit(self) -> None:
-        self._ensure_open()
-        with self._store._lock:
-            if callable(self._store.commit_hook):
-                self._store.commit_hook(self)
+    def _apply(self) -> None:
+        store = self._store
+        with store._lock:
+            if callable(store.commit_hook):
+                store.commit_hook(self)
+            if self._evaluation_key is not None and self._claim_token is not None:
+                current = store._claims.get(self._evaluation_key.identity)
+                if current != self._claim_token:
+                    raise EvaluationInProgressError(
+                        f"Evaluation claim for {self._evaluation_key.identity} was lost "
+                        "before commit"
+                    )
             for obs_id, obs in self._obs.items():
-                self._store._observations[obs_id] = obs
+                store._observations[obs_id] = obs
                 hist_key = (obs.key.metric, obs.key.scope_key)
-                ids = self._store._history.setdefault(hist_key, [])
+                ids = store._history.setdefault(hist_key, [])
                 if obs_id not in ids:
                     ids.append(obs_id)
             for state_key, state_record in self._states.items():
-                existing = self._store._states.get(state_key)
+                existing = store._states.get(state_key)
                 if existing is not None and state_record.version != existing.version + 1:
                     raise StaleEvaluationError(
                         f"Optimistic version conflict for {state_key[0]}/"
                         f"{state_key[1]}: expected version {existing.version + 1}, "
                         f"got {state_record.version}"
                     )
-                self._store._states[state_key] = state_record
+                store._states[state_key] = state_record
             for incident_id, incident in self._incidents.items():
-                self._store._incidents[incident_id] = incident
-            self._store._incident_seq += self._incident_seq_offset
+                store._incidents[incident_id] = incident
+            store._incident_seq += self._incident_seq_offset
             for event_id, event in self._outbox.items():
-                self._store._outbox[event_id] = event
+                store._outbox[event_id] = event
                 if event.event_key:
-                    self._store._outbox_by_key[event.event_key] = event_id
-            self._store._outbox_seq += self._outbox_seq_offset
+                    store._outbox_by_key[event.event_key] = event_id
+            store._outbox_seq += self._outbox_seq_offset
             for identity, evaluation in self._evaluations.items():
-                self._store._evaluations[identity] = evaluation
-            self._committed = True
-
-    def rollback(self) -> None:
-        self._rolled_back = True
-        self._obs.clear()
-        self._states.clear()
-        self._incidents.clear()
-        self._outbox.clear()
-        self._evaluations.clear()
-        self._history_adds.clear()
-
-    def _ensure_open(self) -> None:
-        if self._committed or self._rolled_back:
-            raise MetricRuntimeError("Transaction is already closed")
+                store._evaluations[identity] = evaluation
 
 
 class InMemoryStateStore:
-    """Process-local transactional observation + state + incident + outbox store."""
+    """Process-local transactional observation + state + incident + outbox store.
 
-    def __init__(self) -> None:
+    ``claim_ttl`` (seconds) optionally lets an expired evaluation claim be
+    taken over; the default ``None`` keeps claims until released.
+    """
+
+    def __init__(self, *, claim_ttl: float | None = None) -> None:
         self._lock = threading.RLock()
         self._states: dict[tuple[str, str], MetricStateRecord] = {}
         self._observations: dict[str, StoredObservation] = {}
@@ -212,6 +136,8 @@ class InMemoryStateStore:
         self._outbox_by_key: dict[str, str] = {}
         self._evaluations: dict[str, EvaluationRecord] = {}
         self._claims: dict[str, str] = {}
+        self._claim_expiry: dict[str, datetime] = {}
+        self.claim_ttl = claim_ttl
         # identity -> effective_at for in-flight evaluations per stream.
         self._stream_inflight: dict[tuple[str, str], dict[str, datetime]] = {}
         self._stream_busy: dict[tuple[str, str], str] = {}
@@ -224,6 +150,9 @@ class InMemoryStateStore:
     @staticmethod
     def _obs_id(key: EvaluationKey) -> str:
         return key.identity
+
+    def close(self) -> None:
+        return None
 
     def get_observation(self, key: EvaluationKey) -> StoredObservation | None:
         return self._observations.get(self._obs_id(key))
@@ -347,23 +276,18 @@ class InMemoryStateStore:
         return stored
 
     def list_open_incidents(self) -> list[Incident]:
-        return [i for i in self._incidents.values() if i.state in _ACTIVE_INCIDENT_STATES]
+        return [i for i in self._incidents.values() if i.state in ACTIVE_INCIDENT_STATES]
 
     def find_active_incident(self, metric: str, scope_key: str = "") -> Incident | None:
-        matches = [
-            i
-            for i in self.list_open_incidents()
-            if i.primary_metric == metric and canonical_scope_key(i.scope) == scope_key
-        ]
-        if not matches:
-            return None
+        return latest_incident(
+            [
+                i
+                for i in self.list_open_incidents()
+                if i.primary_metric == metric and canonical_scope_key(i.scope) == scope_key
+            ]
+        )
 
-        def _sort_key(i: Incident) -> str:
-            stamp = i.updated_at or i.opened_at or i.first_detected
-            return ensure_utc(stamp).isoformat()
-
-        matches.sort(key=_sort_key)
-        return matches[-1]
+    # --- notification outbox -------------------------------------------------------
 
     def enqueue_notification(self, event: OutboxEvent) -> OutboxEvent:
         with self.transaction() as tx:
@@ -372,19 +296,64 @@ class InMemoryStateStore:
         return stored
 
     def list_pending_notifications(self) -> list[OutboxEvent]:
-        pending = [e for e in self._outbox.values() if e.delivered_at is None]
+        pending = [e for e in self._outbox.values() if e.pending]
         pending.sort(key=lambda e: ensure_utc(e.created_at).isoformat())
         return pending
 
-    def mark_notification_delivered(self, event_id: str, *, at: datetime) -> OutboxEvent:
+    def claim_pending_notifications(
+        self,
+        *,
+        now: datetime,
+        limit: int | None = None,
+        lease: timedelta,
+    ) -> list[OutboxEvent]:
+        now = ensure_utc(now)
+        with self._lock:
+            due = [
+                e
+                for e in self.list_pending_notifications()
+                if (e.next_attempt_at is None or ensure_utc(e.next_attempt_at) <= now)
+                and (e.claimed_until is None or ensure_utc(e.claimed_until) <= now)
+            ]
+            if limit is not None:
+                due = due[:limit]
+            claimed: list[OutboxEvent] = []
+            for event in due:
+                assert event.id is not None
+                updated = event.model_copy(
+                    update={
+                        "claim_token": uuid.uuid4().hex,
+                        "claimed_until": now + lease,
+                    }
+                )
+                self._outbox[event.id] = updated
+                claimed.append(updated)
+            return claimed
+
+    def _require_lease(self, event: OutboxEvent, claim_token: str | None) -> None:
+        if claim_token is not None and event.claim_token != claim_token:
+            raise NotificationLeaseLostError(
+                f"Outbox event {event.id} lease is no longer held by this worker"
+            )
+
+    def mark_notification_delivered(
+        self,
+        event_id: str,
+        *,
+        at: datetime,
+        claim_token: str | None = None,
+    ) -> OutboxEvent:
         with self._lock:
             event = self._outbox[event_id]
+            self._require_lease(event, claim_token)
             updated = event.model_copy(
                 update={
                     "delivered_at": ensure_utc(at),
                     "last_attempt_at": ensure_utc(at),
                     "attempt_count": event.attempt_count + 1,
                     "last_error": None,
+                    "claim_token": None,
+                    "claimed_until": None,
                 }
             )
             self._outbox[event_id] = updated
@@ -396,21 +365,74 @@ class InMemoryStateStore:
         *,
         at: datetime,
         error: str | None = None,
+        claim_token: str | None = None,
+        next_attempt_at: datetime | None = None,
+        dead_letter: bool = False,
     ) -> OutboxEvent:
         with self._lock:
             event = self._outbox[event_id]
+            self._require_lease(event, claim_token)
             updated = event.model_copy(
                 update={
                     "last_attempt_at": ensure_utc(at),
                     "attempt_count": event.attempt_count + 1,
                     "last_error": error,
+                    "next_attempt_at": (
+                        ensure_utc(next_attempt_at) if next_attempt_at is not None else None
+                    ),
+                    "dead_lettered_at": ensure_utc(at) if dead_letter else None,
+                    "claim_token": None,
+                    "claimed_until": None,
                 }
             )
             self._outbox[event_id] = updated
             return updated
 
+    def release_notification_claim(self, event_id: str, *, claim_token: str) -> None:
+        with self._lock:
+            event = self._outbox.get(event_id)
+            if event is None or event.claim_token != claim_token:
+                return
+            self._outbox[event_id] = event.model_copy(
+                update={"claim_token": None, "claimed_until": None}
+            )
+
+    def next_notification_due_at(self, now: datetime) -> datetime | None:
+        now = ensure_utc(now)
+        candidates: list[datetime] = []
+        with self._lock:
+            for event in self._outbox.values():
+                if not event.pending:
+                    continue
+                due = now
+                if event.next_attempt_at is not None:
+                    due = max(due, ensure_utc(event.next_attempt_at))
+                if event.claimed_until is not None:
+                    due = max(due, ensure_utc(event.claimed_until))
+                candidates.append(due)
+        return min(candidates) if candidates else None
+
+    # --- evaluations, claims and ordering -----------------------------------------
+
     def get_committed_result(self, key: EvaluationKey) -> EvaluationRecord | None:
         return self._evaluations.get(key.identity)
+
+    def latest_committed_evaluation(
+        self,
+        metric: str,
+        scope_key: str | None = None,
+    ) -> EvaluationRecord | None:
+        if scope_key is None:
+            scope_key = canonical_scope_key()
+        with self._lock:
+            matches = [
+                record
+                for record in self._evaluations.values()
+                if record.key.metric == metric and record.key.scope_key == scope_key
+            ]
+        if not matches:
+            return None
+        return max(matches, key=lambda r: ensure_utc(r.effective_at or r.key.eval_at))
 
     def _stream_id(self, key: EvaluationKey) -> tuple[str, str]:
         return (key.metric, key.scope_key)
@@ -422,6 +444,15 @@ class InMemoryStateStore:
             self._stream_conditions[stream] = cond
         return cond
 
+    def _drop_claim(self, identity: str, stream: tuple[str, str]) -> None:
+        self._claims.pop(identity, None)
+        self._claim_expiry.pop(identity, None)
+        inflight = self._stream_inflight.get(stream)
+        if inflight is not None:
+            inflight.pop(identity, None)
+            if not inflight:
+                self._stream_inflight.pop(stream, None)
+
     def claim_evaluation(self, key: EvaluationKey) -> EvaluationClaim:
         with self._lock:
             existing = self._evaluations.get(key.identity)
@@ -431,11 +462,18 @@ class InMemoryStateStore:
                     key=key,
                     record=existing,
                 )
+            stream = self._stream_id(key)
             if key.identity in self._claims:
-                return EvaluationClaim(EvaluationClaimStatus.IN_PROGRESS, key=key)
+                expiry = self._claim_expiry.get(key.identity)
+                if expiry is None or expiry > datetime.now(UTC):
+                    return EvaluationClaim(EvaluationClaimStatus.IN_PROGRESS, key=key)
+                self._drop_claim(key.identity, stream)
             token = uuid.uuid4().hex
             self._claims[key.identity] = token
-            stream = self._stream_id(key)
+            if self.claim_ttl is not None:
+                self._claim_expiry[key.identity] = datetime.now(UTC) + timedelta(
+                    seconds=self.claim_ttl
+                )
             self._stream_inflight.setdefault(stream, {})[key.identity] = ensure_utc(key.eval_at)
             self._stream_condition(stream).notify_all()
             return EvaluationClaim(
@@ -451,13 +489,8 @@ class InMemoryStateStore:
                 return
             if token is not None and current != token:
                 return
-            del self._claims[key.identity]
             stream = self._stream_id(key)
-            inflight = self._stream_inflight.get(stream)
-            if inflight is not None:
-                inflight.pop(key.identity, None)
-                if not inflight:
-                    self._stream_inflight.pop(stream, None)
+            self._drop_claim(key.identity, stream)
             self._stream_condition(stream).notify_all()
 
     @contextmanager
@@ -508,11 +541,16 @@ class InMemoryStateStore:
                 cond.notify_all()
 
     @contextmanager
-    def transaction(self) -> Iterator[_InMemoryTransaction]:
-        tx = _InMemoryTransaction(self)
+    def transaction(
+        self,
+        *,
+        evaluation_key: EvaluationKey | None = None,
+        claim_token: str | None = None,
+    ) -> Iterator[_InMemoryTransaction]:
+        tx = _InMemoryTransaction(self, evaluation_key=evaluation_key, claim_token=claim_token)
         try:
             yield tx
-            if not tx._committed and not tx._rolled_back:
+            if not tx.closed:
                 # Auto-rollback if caller forgot commit.
                 tx.rollback()
         except Exception:
@@ -530,3 +568,7 @@ class InMemoryStateStore:
             stacklevel=2,
         )
         tx.commit()
+
+
+# Preferred public name: the store holds more than state.
+InMemoryRuntimeStore = InMemoryStateStore

@@ -42,11 +42,19 @@ duckdb = [
   "pandas>=2.2,<4",
   "numpy>=1.26,<3",
 ]
+postgres = [
+  "psycopg[binary]>=3.1,<4",
+  "psycopg-pool>=3.2,<4",
+]
 demo = [
   "metric-runtime[duckdb]",
   "plotly>=5.22,<7",
   "marimo>=0.13,<1",
   "altair>=5.3,<6",
+]
+judgment-demo = [
+  "metric-runtime[demo]",
+  "pydantic-ai[typesafe]>=1.0",
 ]
 dev = [
   "pytest>=8,<10",
@@ -58,7 +66,7 @@ yaml = [
   "pyyaml>=6.0,<7",
 ]
 all = [
-  "metric-runtime[demo,dev]",
+  "metric-runtime[demo,dev,judgment-demo,postgres]",
 ]
 
 [project.scripts]
@@ -74,7 +82,7 @@ Issues = "https://github.com/data-foundry-ch/metric-runtime/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-metric_runtime = ["py.typed"]
+metric_runtime = ["py.typed", "stores/migrations/postgres/*.sql"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
@@ -89,6 +97,8 @@ target-version = "py311"
 src = ["src", "tests", "examples"]
 extend-exclude = [
   "examples/pypizza/app.py",
+  "examples/judgment_comparison/app.py",
+  "examples/metric_judgment_eval/app.py",
   "notebooks",
   "apps",
 ]

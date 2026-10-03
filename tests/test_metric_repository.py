@@ -44,7 +44,7 @@ def test_metric_id_rules():
     with pytest.raises(InvalidMetricDefinitionError):
         validate_metric_id("profit-margin")
     with pytest.raises(InvalidMetricDefinitionError):
-        Metric(id="finance.profit", name="x")
+        Metric(id="finance.profit", name="x", formula=Formula.sum("x"))
 
 
 def test_duplicate_ids_fail():

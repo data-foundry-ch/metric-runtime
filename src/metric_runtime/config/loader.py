@@ -7,7 +7,7 @@ from typing import Any
 
 from metric_runtime.config.environment import resolve_environment_variables
 from metric_runtime.config.models import ConnectionsFile, MetricRuntimeProjectConfig
-from metric_runtime.exceptions import ConfigurationError
+from metric_runtime.exceptions import ConfigurationError, MissingEnvironmentVariableError
 
 try:
     import yaml
@@ -86,26 +86,38 @@ def load_connections_config(
     if resolved is None:
         return ConnectionsFile(), None
     raw = _read_yaml(resolved)
+    unresolved: dict[str, Exception] = {}
     if resolve_env:
-        # Resolve per-connection so error messages name the connection.
+        # Resolve per-connection so error messages name the connection. A
+        # connection with a missing variable only fails when a profile uses it.
         connections = raw.get("connections") or {}
         resolved_connections: dict[str, Any] = {}
         for name, cfg in connections.items():
-            resolved_connections[name] = resolve_environment_variables(
-                cfg,
-                context=f'connection "{name}"',
-                env=env,
-            )
+            try:
+                resolved_connections[name] = resolve_environment_variables(
+                    cfg,
+                    context=f'connection "{name}"',
+                    env=env,
+                )
+            except MissingEnvironmentVariableError as exc:
+                unresolved[name] = exc
+                resolved_connections[name] = cfg
         raw = {**raw, "connections": resolved_connections}
     try:
-        return ConnectionsFile.model_validate(raw), resolved
+        parsed = ConnectionsFile.model_validate(raw)
     except Exception as exc:  # noqa: BLE001
         raise ConfigurationError(f"Invalid connections config in {resolved}: {exc}") from exc
+    parsed._unresolved = unresolved
+    return parsed, resolved
 
 
 def redact_secrets(data: Any) -> Any:
     """Redact values that look like secrets for diagnostic output."""
     secret_keys = {
+        "authorization",
+        "dsn",
+        "headers",
+        "url",
         "password",
         "secret",
         "token",

@@ -74,7 +74,7 @@ def rank_explanatory_candidates(
                 owner=catalog[name].owner,
                 depth=depth,
                 status=status,
-                impact_eur=impact,
+                impact=impact,
                 score=score,
             )
         )
@@ -132,7 +132,7 @@ def investigate_metric(
         explanatory_paths=paths,
         deepest_candidates=deepest,
         primary_explanatory=deepest[0] if deepest else None,
-        impact_eur=impact,
+        impact=impact,
     )
 
 
@@ -185,7 +185,7 @@ def investigate_window(
         explanatory_paths=paths,
         deepest_candidates=deepest,
         primary_explanatory=deepest[0] if deepest else None,
-        impact_eur=impact,
+        impact=impact,
     )
 
 
