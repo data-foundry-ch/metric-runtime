@@ -1,4 +1,4 @@
-"""State persistence adapters."""
+"""Runtime store adapters (observations, state, evaluations, incidents, outbox)."""
 
 from metric_runtime.identity import EvaluationKey, canonical_scope_json, canonical_scope_key
 from metric_runtime.stores.base import (
@@ -6,17 +6,20 @@ from metric_runtime.stores.base import (
     MetricStateStore,
     NotificationOutbox,
     ObservationStore,
+    RuntimeStore,
     StateStore,
 )
-from metric_runtime.stores.memory import InMemoryStateStore
+from metric_runtime.stores.memory import InMemoryRuntimeStore, InMemoryStateStore
 
 __all__ = [
     "EvaluationKey",
     "IncidentStore",
+    "InMemoryRuntimeStore",
     "InMemoryStateStore",
     "MetricStateStore",
     "NotificationOutbox",
     "ObservationStore",
+    "RuntimeStore",
     "StateStore",
     "canonical_scope_json",
     "canonical_scope_key",

@@ -10,7 +10,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, TypeAdapter, field_validator
 
-from metric_runtime.models import Formula
+from metric_runtime.measures import Formula
 
 
 def _validate_scalar_bindings(value: dict[str, Any]) -> dict[str, Any]:

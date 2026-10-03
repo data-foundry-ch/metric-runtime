@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 import networkx as nx
 
-from metric_runtime import KPI, KPICatalog
+from metric_runtime import KPI, Formula, KPICatalog
 from metric_runtime.graph import build_business_graph, mark_root_candidates
 from metric_runtime.models import Directionality, KPIState, KPIStatus
 
@@ -32,9 +32,9 @@ def _status(name: str, *, anomaly: bool, directionality: Directionality) -> KPIS
 def test_graph_acyclic_and_edges():
     cat = KPICatalog(
         [
-            KPI(name="leaf", owner="a"),
-            KPI(name="mid", owner="b", dependencies=("leaf",)),
-            KPI(name="top", owner="c", dependencies=("mid",)),
+            KPI(name="leaf", owner="a", formula=Formula.sum("leaf")),
+            KPI(name="mid", owner="b", dependencies=("leaf",), formula=Formula.sum("mid")),
+            KPI(name="top", owner="c", dependencies=("mid",), formula=Formula.sum("top")),
         ]
     )
     g = build_business_graph(cat.as_dict())
@@ -49,11 +49,13 @@ def test_root_candidates_ignore_two_sided():
             name="basket_threshold_concentration",
             owner="promo",
             directionality=Directionality.HIGHER_IS_BAD,
+            formula=Formula.sum("x"),
         ),
         "orders": KPI(
             name="orders",
             owner="growth",
             directionality=Directionality.TWO_SIDED,
+            formula=Formula.sum("orders"),
         ),
     }
     statuses = {

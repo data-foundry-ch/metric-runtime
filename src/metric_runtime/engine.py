@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 from metric_runtime.catalog import MetricCatalog
 from metric_runtime.detectors import DetectorStrategy, SeasonalZScoreDetector
@@ -15,7 +16,9 @@ from metric_runtime.detectors.specs import build_detector
 from metric_runtime.exceptions import (
     EvaluationInProgressError,
     MetricRuntimeError,
+    NoDataError,
     StaleEvaluationError,
+    StreamCommitConflict,
     UnknownMetricError,
 )
 from metric_runtime.identity import EvaluationKey, ensure_utc
@@ -24,6 +27,7 @@ from metric_runtime.models import (
     DrilldownRow,
     EvaluationRecord,
     IncidentState,
+    InvestigationResult,
     KPIState,
     KPIStateTransition,
     KPIStatus,
@@ -36,9 +40,19 @@ from metric_runtime.models import (
     StoredObservation,
 )
 from metric_runtime.notifications.base import Notifier, NullNotifier
+from metric_runtime.notifications.delivery import NotificationPolicy, deliver_pending
 from metric_runtime.state import StatePolicy, evolve_state, signals_from_history
 from metric_runtime.stores.base import EvaluationClaimStatus
 from metric_runtime.stores.memory import InMemoryStateStore
+
+
+class _CommitOutcome(NamedTuple):
+    transition: KPIStateTransition
+    record: EvaluationRecord
+    new_incident_ids: list[str]
+    updated_incident_ids: list[str]
+    notifications: list[OutboxEvent]
+    investigation: InvestigationResult | None
 
 
 def _resolve_detector(
@@ -73,7 +87,15 @@ class KPIEngine:
         state_policy: StatePolicy | None = None,
         preferred_leaves: tuple[str, ...] = (),
         batch_registry=None,
+        runtime_store=None,
+        notification_policy: NotificationPolicy | None = None,
     ):
+        if (
+            runtime_store is not None
+            and state_store is not None
+            and runtime_store is not state_store
+        ):
+            raise MetricRuntimeError("Pass runtime_store= or state_store= (deprecated), not both")
         if isinstance(catalog, MetricCatalog):
             self._catalog = catalog
         elif isinstance(catalog, dict):
@@ -87,9 +109,12 @@ class KPIEngine:
             executor = DuckDBExecutor(connection, fact_table=fact_table)
 
         self.executor = executor
-        self.state_store = state_store or InMemoryStateStore()
+        self.runtime_store = runtime_store or state_store or InMemoryStateStore()
         self.detector = detector or SeasonalZScoreDetector()
         self.notifier = notifier or NullNotifier()
+        self.notification_policy = notification_policy or NotificationPolicy()
+        # Bounded re-entries of the ordered section on StreamCommitConflict.
+        self.commit_attempts = 3
         self.state_policy = state_policy or StatePolicy()
         self.preferred_leaves = preferred_leaves
         self.batch_registry = batch_registry
@@ -97,6 +122,15 @@ class KPIEngine:
         # Convenience attributes used by example quality helpers.
         self.fact_table = getattr(executor, "fact_table", fact_table)
         self.con = getattr(executor, "con", connection)
+
+    @property
+    def state_store(self):
+        """Back-compat alias for :attr:`runtime_store`."""
+        return self.runtime_store
+
+    @state_store.setter
+    def state_store(self, value) -> None:
+        self.runtime_store = value
 
     @property
     def catalog(self) -> dict[str, Metric]:
@@ -152,6 +186,7 @@ class KPIEngine:
             self._catalog,
             executor=self.executor,
             batch_registry=self.batch_registry or BatchRegistry(),
+            sql_dialects=getattr(self.executor, "sql_dialects", None),
         )
 
     @property
@@ -166,18 +201,47 @@ class KPIEngine:
         filters: dict[str, str] | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
+        *,
+        session=None,
     ) -> float:
         from metric_runtime.calculations.context import ObservationValueStatus
         from metric_runtime.calculations.session import build_evaluation_context
 
         context = build_evaluation_context(at=at, start=start, end=end, filters=filters)
-        result = self.new_evaluation_session().calculate_value(metric_name, context)
+        eval_session = session or self.new_evaluation_session()
+        result = eval_session.calculate_value(metric_name, context)
+        if result.status == ObservationValueStatus.NO_DATA or (
+            result.status == ObservationValueStatus.VALUE and result.value is None
+        ):
+            raise NoDataError(
+                f"KPI {metric_name!r} produced {ObservationValueStatus.NO_DATA.value}"
+                + (f": {result.error}" if result.error else " (no data)")
+            )
         if result.status != ObservationValueStatus.VALUE or result.value is None:
             raise MetricRuntimeError(
                 f"KPI {metric_name!r} produced {result.status.value}"
                 + (f": {result.error}" if result.error else " (no data)")
             )
         return float(result.value)
+
+    def _usable_baseline(self, metric_name: str, windows: list[dict]) -> list[float]:
+        """Baseline values, skipping windows that produced NO_DATA.
+
+        Raises :class:`NoDataError` (reason ``no_baseline``) when baseline
+        windows were requested but none produced a value.
+        """
+        values: list[float] = []
+        for kwargs in windows:
+            try:
+                values.append(self.metric_value(metric_name, **kwargs))
+            except NoDataError:
+                continue
+        if windows and not values:
+            raise NoDataError(
+                f"KPI {metric_name!r} has no usable baseline windows",
+                reason="no_baseline",
+            )
+        return values
 
     def measure_value(
         self,
@@ -214,11 +278,13 @@ class KPIEngine:
         metric_name: str,
         at: datetime,
         filters: dict[str, str] | None = None,
+        *,
+        session=None,
     ) -> list[float]:
         metric = self._get_kpi(metric_name)
         _, cfg = _resolve_detector(metric, self.detector)
         return [
-            self.metric_value(metric_name, at - timedelta(weeks=i), filters)
+            self.metric_value(metric_name, at - timedelta(weeks=i), filters, session=session)
             for i in range(1, cfg.baseline_weeks + 1)
         ]
 
@@ -227,12 +293,20 @@ class KPIEngine:
         metric_name: str,
         at: datetime,
         filters: dict[str, str] | None = None,
+        *,
+        session=None,
     ) -> KPIStatus:
         at = ensure_utc(at)
         metric = self._get_kpi(metric_name)
         strategy, cfg = _resolve_detector(metric, self.detector)
-        current = self.metric_value(metric_name, at, filters)
-        baseline = self.baseline_values(metric_name, at, filters)
+        current = self.metric_value(metric_name, at, filters, session=session)
+        baseline = self._usable_baseline(
+            metric_name,
+            [
+                {"at": at - timedelta(weeks=i), "filters": filters, "session": session}
+                for i in range(1, cfg.baseline_weeks + 1)
+            ],
+        )
         support = self.support_value(metric_name, at, filters)
         support_ok = True
         if metric.support is not None:
@@ -264,15 +338,17 @@ class KPIEngine:
         strategy, cfg = _resolve_detector(metric, self.detector)
         weeks = baseline_weeks if baseline_weeks is not None else cfg.baseline_weeks
         current = self.metric_value(metric_name, filters=filters, start=start, end=end)
-        baseline = [
-            self.metric_value(
-                metric_name,
-                filters=filters,
-                start=start - timedelta(weeks=i),
-                end=end - timedelta(weeks=i),
-            )
-            for i in range(1, weeks + 1)
-        ]
+        baseline = self._usable_baseline(
+            metric_name,
+            [
+                {
+                    "filters": filters,
+                    "start": start - timedelta(weeks=i),
+                    "end": end - timedelta(weeks=i),
+                }
+                for i in range(1, weeks + 1)
+            ],
+        )
         support = self.support_value(metric_name, filters=filters, start=start, end=end)
         support_ok = True
         if metric.support is not None:
@@ -289,6 +365,21 @@ class KPIEngine:
             as_of=end,
         )
 
+    def estimate_impact(
+        self,
+        metric_name: str,
+        at: datetime,
+        current_value: float,
+        baseline_value: float,
+        filters: dict[str, str] | None = None,
+    ) -> float:
+        """Estimate absolute business impact (currency-agnostic magnitude).
+
+        Delegates to :meth:`estimate_impact_eur` so existing monkeypatches keep
+        working during the rename transition.
+        """
+        return self.estimate_impact_eur(metric_name, at, current_value, baseline_value, filters)
+
     def estimate_impact_eur(
         self,
         metric_name: str,
@@ -297,6 +388,7 @@ class KPIEngine:
         baseline_value: float,
         filters: dict[str, str] | None = None,
     ) -> float:
+        """Impact estimator (name retained for back-compat; currency-agnostic)."""
         metric = self._get_kpi(metric_name)
         kind = metric.impact.kind
 
@@ -339,7 +431,7 @@ class KPIEngine:
             status = self.evaluate(metric_name, at, filters)
             if only_anomalies and not status.anomaly:
                 continue
-            impact_eur = self.estimate_impact_eur(
+            impact = self.estimate_impact_eur(
                 metric_name,
                 at,
                 status.value,
@@ -355,10 +447,10 @@ class KPIEngine:
                     z_score=status.z_score,
                     anomaly=status.anomaly,
                     support=status.support,
-                    impact_eur=impact_eur,
+                    impact=impact,
                 )
             )
-        rows.sort(key=lambda row: row.impact_eur, reverse=True)
+        rows.sort(key=lambda row: row.impact, reverse=True)
         return rows
 
     def investigate(
@@ -429,35 +521,20 @@ class KPIEngine:
         return KPIState.ACKNOWLEDGED
 
     def deliver_notifications(self, *, limit: int | None = None) -> list[OutboxEvent]:
-        """Delivery worker: send pending outbox events through the notifier.
+        """Delivery worker: send due outbox events through the notifier.
 
-        External delivery is at-least-once. Failures are recorded on the event
-        and do not block later events. Returns events successfully marked delivered
-        in this pass.
+        Thin wrapper over :func:`~metric_runtime.notifications.delivery.deliver_pending`
+        using ``self.notification_policy``. External delivery is at-least-once.
+        Failures are recorded on the event and do not block later events.
+        Returns events successfully marked delivered in this pass.
         """
-        pending = self.state_store.list_pending_notifications()
-        if limit is not None:
-            pending = pending[:limit]
-        delivered: list[OutboxEvent] = []
-        for event in pending:
-            now = datetime.now(UTC)
-            try:
-                if event.incident is not None:
-                    self.notifier.notify(
-                        event.incident,
-                        idempotency_key=event.event_key or event.id,
-                    )
-            except Exception as exc:  # noqa: BLE001 - record and continue
-                assert event.id is not None
-                self.state_store.record_notification_attempt(
-                    event.id,
-                    at=now,
-                    error=str(exc)[:500],
-                )
-                continue
-            assert event.id is not None
-            delivered.append(self.state_store.mark_notification_delivered(event.id, at=now))
-        return delivered
+        report = deliver_pending(
+            self.runtime_store,
+            self.notifier,
+            policy=self.notification_policy,
+            limit=limit,
+        )
+        return report.delivered
 
     def _result_from_record(self, record: EvaluationRecord) -> ProcessResult:
         """Reconstruct an idempotent ProcessResult from a committed record."""
@@ -505,26 +582,26 @@ class KPIEngine:
         quality: QualityReport | None = None,
         preferred_leaves: tuple[str, ...] = (),
         context: list[str] | None = None,
+        session=None,
     ) -> ProcessResult:
         """Authoritative runtime tick with atomic, ordered commit semantics.
 
         Calculate once per EvaluationKey. Apply metric-state transitions in
         ``effective_at`` order per (metric, scope). Commit once.
-        """
-        from metric_runtime.incidents import incident_from_investigation
-        from metric_runtime.state import (
-            _trailing_detection_streak,
-            _trailing_healthy_streak,
-        )
 
+        Pass a shared ``session`` (see :meth:`process_many`) so BatchCalculation
+        sources execute once across related metrics.
+
+        A current window that produces NO_DATA is committed as a NO_DATA
+        evaluation (state carried forward, no incidents/outbox). Calculation
+        errors raise and commit nothing, so the window can be retried.
+        """
         scope = dict(scope or {})
         leaves = preferred_leaves or self.preferred_leaves
-        policy = self.state_policy
         eval_key = EvaluationKey.build(metric, scope=scope, at=at, start=start, end=end)
-        scope_key = eval_key.scope_key
         eval_at = eval_key.eval_at
 
-        claim = self.state_store.claim_evaluation(eval_key)
+        claim = self.runtime_store.claim_evaluation(eval_key)
         if claim.status == EvaluationClaimStatus.ALREADY_COMMITTED:
             assert claim.record is not None
             return self._result_from_record(claim.record)
@@ -534,39 +611,160 @@ class KPIEngine:
             )
 
         try:
-            if start is not None and end is not None:
-                status = self.evaluate_window(metric, start, end, scope)
-            else:
-                assert at is not None
-                status = self.evaluate(metric, at, scope)
+            no_data_reason: str | None = None
+            try:
+                if start is not None and end is not None:
+                    status = self.evaluate_window(metric, start, end, scope)
+                else:
+                    assert at is not None
+                    if session is None:
+                        status = self.evaluate(metric, at, scope)
+                    else:
+                        status = self.evaluate(metric, at, scope, session=session)
+            except NoDataError as exc:
+                no_data_reason = exc.reason
+                status = self._no_data_status(metric, eval_at)
 
             quality_ok = True if quality is None else quality.healthy
             now = datetime.now(UTC)
             observation = StoredObservation(
                 key=eval_key,
                 status=status,
-                eligible_for_state=quality_ok,
+                eligible_for_state=quality_ok and no_data_reason is None,
                 quality_healthy=None if quality is None else quality.healthy,
                 recorded_at=now,
+                value_status="value" if no_data_reason is None else "no_data",
+                no_data_reason=no_data_reason,
             )
 
-            # Warehouse work may finish out of order; metric-state application
-            # is serialized by effective_at for this (metric, scope) stream.
-            with self.state_store.ordered_stream_commit(eval_key):
-                previous_record = self.state_store.get_state_record(metric, scope_key)
-                if (
-                    previous_record.last_evaluation_at is not None
-                    and ensure_utc(previous_record.last_evaluation_at) >= eval_at
-                ):
-                    raise StaleEvaluationError(
-                        f"Stale evaluation for {metric}: "
-                        f"effective_at={eval_at.isoformat()} is not after "
-                        f"last_evaluation_at="
-                        f"{ensure_utc(previous_record.last_evaluation_at).isoformat()}"
+            attempts = 0
+            while True:
+                try:
+                    outcome = self._commit_ordered(
+                        eval_key,
+                        claim_token=claim.token,
+                        observation=observation,
+                        status=status,
+                        scope=scope,
+                        quality=quality,
+                        leaves=leaves,
+                        context=context,
+                        now=now,
                     )
+                    break
+                except StreamCommitConflict:
+                    attempts += 1
+                    if attempts >= max(1, self.commit_attempts):
+                        raise
 
-                previous = previous_record.state
-                history = list(self.state_store.get_history(metric, scope_key)) + [observation]
+            store = self.runtime_store
+            return ProcessResult(
+                metric=metric,
+                scope=scope,
+                evaluation_key=eval_key,
+                at=eval_at,
+                status=status,
+                transition=outcome.transition,
+                new_incidents=[
+                    i
+                    for iid in outcome.new_incident_ids
+                    if (i := store.get_incident(iid)) is not None
+                ],
+                updated_incidents=[
+                    i
+                    for iid in outcome.updated_incident_ids
+                    if (i := store.get_incident(iid)) is not None
+                ],
+                notifications=outcome.notifications,
+                investigation=outcome.investigation,
+                idempotent=False,
+                evaluation_record=outcome.record,
+                processed_at=now,
+            )
+        finally:
+            self.runtime_store.release_evaluation_claim(eval_key, token=claim.token)
+
+    def _no_data_status(self, metric_name: str, as_of: datetime) -> KPIStatus:
+        metric = self._get_kpi(metric_name)
+        return KPIStatus(
+            name=metric_name,
+            value=0.0,
+            baseline_mean=0.0,
+            baseline_std=0.0,
+            z_score=0.0,
+            relative_change=0.0,
+            anomaly=False,
+            support=0.0,
+            support_ok=False,
+            as_of=as_of,
+            directionality=metric.directionality,
+            value_status="no_data",
+        )
+
+    def _commit_ordered(
+        self,
+        eval_key: EvaluationKey,
+        *,
+        claim_token: str | None,
+        observation: StoredObservation,
+        status: KPIStatus,
+        scope: dict[str, str],
+        quality: QualityReport | None,
+        leaves: tuple[str, ...],
+        context: list[str] | None,
+        now: datetime,
+    ) -> _CommitOutcome:
+        """Ordered section: read state, compute transition, stage and commit once.
+
+        Re-entered by :meth:`process` on :class:`StreamCommitConflict`.
+        """
+        from metric_runtime.incidents import incident_from_investigation
+        from metric_runtime.state import (
+            _trailing_detection_streak,
+            _trailing_healthy_streak,
+        )
+
+        store = self.runtime_store
+        policy = self.state_policy
+        metric = eval_key.metric
+        scope_key = eval_key.scope_key
+        eval_at = eval_key.eval_at
+
+        # Warehouse work may finish out of order; metric-state application
+        # is serialized by effective_at for this (metric, scope) stream.
+        with store.ordered_stream_commit(eval_key):
+            previous_record = store.get_state_record(metric, scope_key)
+            if (
+                previous_record.last_evaluation_at is not None
+                and ensure_utc(previous_record.last_evaluation_at) >= eval_at
+            ):
+                raise StaleEvaluationError(
+                    f"Stale evaluation for {metric}: "
+                    f"effective_at={eval_at.isoformat()} is not after "
+                    f"last_evaluation_at="
+                    f"{ensure_utc(previous_record.last_evaluation_at).isoformat()}"
+                )
+
+            previous = previous_record.state
+            investigation = None
+            draft_incident = None
+            merge_active = None
+            outbox_drafts: list[OutboxEvent] = []
+
+            if observation.is_no_data:
+                # NO_DATA is a fact about this window, not a signal: carry the
+                # state forward unchanged and only advance version/cursor.
+                current = previous
+                state_record = previous_record.model_copy(
+                    update={
+                        "scope": scope or previous_record.scope,
+                        "updated_at": now,
+                        "last_evaluation_at": eval_at,
+                        "version": previous_record.version + 1,
+                    }
+                )
+            else:
+                history = list(store.get_history(metric, scope_key)) + [observation]
                 signals = signals_from_history(history)
                 impact = self.estimate_impact_eur(
                     metric, eval_at, status.value, status.baseline_mean, scope
@@ -574,7 +772,7 @@ class KPIEngine:
                 current = evolve_state(
                     signals,
                     policy=policy,
-                    impact_eur=impact,
+                    impact=impact,
                     quality=quality,
                     previous=previous,
                 )
@@ -587,8 +785,6 @@ class KPIEngine:
                         if delta < timedelta(minutes=policy.cooldown_minutes):
                             current = KPIState.RESOLVED
 
-                detection_streak = _trailing_detection_streak(signals)
-                healthy_streak = _trailing_healthy_streak(signals)
                 resolved_at = previous_record.resolved_at
                 opened_at = previous_record.opened_at
                 acknowledged_at = previous_record.acknowledged_at
@@ -611,19 +807,13 @@ class KPIEngine:
                     opened_at=opened_at,
                     acknowledged_at=acknowledged_at,
                     resolved_at=resolved_at,
-                    detection_streak=detection_streak,
-                    healthy_streak=healthy_streak,
+                    detection_streak=_trailing_detection_streak(signals),
+                    healthy_streak=_trailing_healthy_streak(signals),
                     last_evaluation_at=eval_at,
                     version=previous_record.version + 1,
                 )
-                transition = KPIStateTransition(previous=previous, current=current)
 
-                investigation = None
-                draft_incident = None
-                merge_active = None
-                outbox_drafts: list[OutboxEvent] = []
-                active = self.state_store.find_active_incident(metric, scope_key)
-
+                active = store.find_active_incident(metric, scope_key)
                 if current == KPIState.OPEN:
                     investigation = self.investigate(
                         metric, at=eval_at, filters=scope, preferred_leaves=leaves
@@ -672,180 +862,206 @@ class KPIEngine:
                     )
                     merge_active = active
 
-                with self.state_store.transaction() as tx:
-                    tx.stage_observation(observation)
-                    tx.stage_state_record(state_record)
+            transition = KPIStateTransition(previous=previous, current=current)
 
-                    new_incident_ids: list[str] = []
-                    updated_incident_ids: list[str] = []
-                    staged_incidents: list = []
+            with store.transaction(evaluation_key=eval_key, claim_token=claim_token) as tx:
+                tx.stage_observation(observation)
+                tx.stage_state_record(state_record)
 
-                    if current == KPIState.OPEN and draft_incident is not None:
-                        if merge_active is None:
-                            stored = tx.stage_incident(draft_incident)
-                            staged_incidents.append(stored)
-                            new_incident_ids.append(stored.id)  # type: ignore[arg-type]
-                            outbox_drafts.append(
-                                OutboxEvent(
-                                    event_key=self._outbox_event_key(
-                                        kind="incident_opened",
-                                        metric=metric,
-                                        incident_id=stored.id,
-                                        previous=previous,
-                                        current=current,
-                                        eval_identity=eval_key.identity,
-                                    ),
-                                    kind="incident_opened",
-                                    incident_id=stored.id,
-                                    incident=stored,
-                                    metric=metric,
-                                    previous_state=previous,
-                                    current_state=current,
-                                    message=f"Opened incident for {metric}",
-                                    created_at=now,
-                                )
-                            )
-                        else:
-                            meaningful = (
-                                previous != current
-                                or merge_active.explanatory_kpi != draft_incident.explanatory_kpi
-                                or merge_active.owner != draft_incident.owner
-                                or merge_active.state != IncidentState.OPEN
-                            )
-                            merged = draft_incident.model_copy(
-                                update={
-                                    "id": merge_active.id,
-                                    "first_detected": merge_active.first_detected,
-                                    "opened_at": merge_active.opened_at or draft_incident.opened_at,
-                                    "state": IncidentState.OPEN,
-                                }
-                            )
-                            stored = tx.stage_incident(merged)
-                            staged_incidents.append(stored)
-                            updated_incident_ids.append(stored.id)  # type: ignore[arg-type]
-                            if meaningful:
-                                outbox_drafts.append(
-                                    OutboxEvent(
-                                        event_key=self._outbox_event_key(
-                                            kind="incident_updated",
-                                            metric=metric,
-                                            incident_id=stored.id,
-                                            previous=previous,
-                                            current=current,
-                                            eval_identity=eval_key.identity,
-                                        ),
-                                        kind="incident_updated",
-                                        incident_id=stored.id,
-                                        incident=stored,
-                                        metric=metric,
-                                        previous_state=previous,
-                                        current_state=current,
-                                        message=f"Updated incident for {metric}",
-                                        created_at=now,
-                                    )
-                                )
+                new_incident_ids: list[str] = []
+                updated_incident_ids: list[str] = []
+                staged_incidents: list = []
 
-                    elif current == KPIState.RESOLVED and draft_incident is not None:
+                if current == KPIState.OPEN and draft_incident is not None:
+                    if merge_active is None:
                         stored = tx.stage_incident(draft_incident)
                         staged_incidents.append(stored)
-                        updated_incident_ids.append(stored.id)  # type: ignore[arg-type]
-                        if previous != current:
-                            outbox_drafts.append(
-                                OutboxEvent(
-                                    event_key=self._outbox_event_key(
-                                        kind="incident_resolved",
-                                        metric=metric,
-                                        incident_id=stored.id,
-                                        previous=previous,
-                                        current=current,
-                                        eval_identity=eval_key.identity,
-                                    ),
-                                    kind="incident_resolved",
-                                    incident_id=stored.id,
-                                    incident=stored,
-                                    metric=metric,
-                                    previous_state=previous,
-                                    current_state=current,
-                                    message=f"Resolved incident for {metric}",
-                                    created_at=now,
-                                )
-                            )
-
-                    elif (
-                        current == KPIState.SUPPRESSED
-                        and previous != current
-                        and draft_incident is not None
-                    ):
-                        # Notifier protocol requires an Incident — only enqueue
-                        # when an active incident is being suppressed.
-                        stored = tx.stage_incident(draft_incident)
-                        staged_incidents.append(stored)
-                        updated_incident_ids.append(stored.id)  # type: ignore[arg-type]
+                        new_incident_ids.append(stored.id)  # type: ignore[arg-type]
                         outbox_drafts.append(
                             OutboxEvent(
                                 event_key=self._outbox_event_key(
-                                    kind="state_changed",
+                                    kind="incident_opened",
                                     metric=metric,
                                     incident_id=stored.id,
                                     previous=previous,
                                     current=current,
                                     eval_identity=eval_key.identity,
                                 ),
-                                kind="state_changed",
+                                kind="incident_opened",
                                 incident_id=stored.id,
                                 incident=stored,
                                 metric=metric,
                                 previous_state=previous,
                                 current_state=current,
-                                message=f"Suppressed {metric} due to data quality",
+                                message=f"Opened incident for {metric}",
+                                created_at=now,
+                            )
+                        )
+                    else:
+                        meaningful = (
+                            previous != current
+                            or merge_active.explanatory_kpi != draft_incident.explanatory_kpi
+                            or merge_active.owner != draft_incident.owner
+                            or merge_active.state != IncidentState.OPEN
+                        )
+                        merged = draft_incident.model_copy(
+                            update={
+                                "id": merge_active.id,
+                                "first_detected": merge_active.first_detected,
+                                "opened_at": merge_active.opened_at or draft_incident.opened_at,
+                                "state": IncidentState.OPEN,
+                            }
+                        )
+                        stored = tx.stage_incident(merged)
+                        staged_incidents.append(stored)
+                        updated_incident_ids.append(stored.id)  # type: ignore[arg-type]
+                        if meaningful:
+                            outbox_drafts.append(
+                                OutboxEvent(
+                                    event_key=self._outbox_event_key(
+                                        kind="incident_updated",
+                                        metric=metric,
+                                        incident_id=stored.id,
+                                        previous=previous,
+                                        current=current,
+                                        eval_identity=eval_key.identity,
+                                    ),
+                                    kind="incident_updated",
+                                    incident_id=stored.id,
+                                    incident=stored,
+                                    metric=metric,
+                                    previous_state=previous,
+                                    current_state=current,
+                                    message=f"Updated incident for {metric}",
+                                    created_at=now,
+                                )
+                            )
+
+                elif current == KPIState.RESOLVED and draft_incident is not None:
+                    stored = tx.stage_incident(draft_incident)
+                    staged_incidents.append(stored)
+                    updated_incident_ids.append(stored.id)  # type: ignore[arg-type]
+                    if previous != current:
+                        outbox_drafts.append(
+                            OutboxEvent(
+                                event_key=self._outbox_event_key(
+                                    kind="incident_resolved",
+                                    metric=metric,
+                                    incident_id=stored.id,
+                                    previous=previous,
+                                    current=current,
+                                    eval_identity=eval_key.identity,
+                                ),
+                                kind="incident_resolved",
+                                incident_id=stored.id,
+                                incident=stored,
+                                metric=metric,
+                                previous_state=previous,
+                                current_state=current,
+                                message=f"Resolved incident for {metric}",
                                 created_at=now,
                             )
                         )
 
-                    notifications = [tx.stage_notification(ev) for ev in outbox_drafts]
-                    incident_ids = [i.id for i in staged_incidents if i.id is not None]
-                    record = EvaluationRecord(
-                        key=eval_key,
-                        observation=observation,
-                        transition=transition,
-                        status=status,
-                        state_record=state_record,
-                        incident_ids=incident_ids,
-                        outbox_event_ids=[e.id for e in notifications if e.id],
-                        new_incident_ids=new_incident_ids,
-                        updated_incident_ids=updated_incident_ids,
-                        investigation=investigation,
-                        committed_at=now,
-                        effective_at=eval_at,
+                elif (
+                    current == KPIState.SUPPRESSED
+                    and previous != current
+                    and draft_incident is not None
+                ):
+                    # Notifier protocol requires an Incident — only enqueue
+                    # when an active incident is being suppressed.
+                    stored = tx.stage_incident(draft_incident)
+                    staged_incidents.append(stored)
+                    updated_incident_ids.append(stored.id)  # type: ignore[arg-type]
+                    outbox_drafts.append(
+                        OutboxEvent(
+                            event_key=self._outbox_event_key(
+                                kind="state_changed",
+                                metric=metric,
+                                incident_id=stored.id,
+                                previous=previous,
+                                current=current,
+                                eval_identity=eval_key.identity,
+                            ),
+                            kind="state_changed",
+                            incident_id=stored.id,
+                            incident=stored,
+                            metric=metric,
+                            previous_state=previous,
+                            current_state=current,
+                            message=f"Suppressed {metric} due to data quality",
+                            created_at=now,
+                        )
                     )
-                    tx.stage_evaluation_record(record)
-                    tx.commit()
 
-            return ProcessResult(
-                metric=metric,
+                notifications = [tx.stage_notification(ev) for ev in outbox_drafts]
+                incident_ids = [i.id for i in staged_incidents if i.id is not None]
+                record = EvaluationRecord(
+                    key=eval_key,
+                    observation=observation,
+                    transition=transition,
+                    status=status,
+                    state_record=state_record,
+                    incident_ids=incident_ids,
+                    outbox_event_ids=[e.id for e in notifications if e.id],
+                    new_incident_ids=new_incident_ids,
+                    updated_incident_ids=updated_incident_ids,
+                    investigation=investigation,
+                    committed_at=now,
+                    effective_at=eval_at,
+                )
+                tx.stage_evaluation_record(record)
+                tx.commit()
+
+        return _CommitOutcome(
+            transition=transition,
+            record=record,
+            new_incident_ids=new_incident_ids,
+            updated_incident_ids=updated_incident_ids,
+            notifications=notifications,
+            investigation=investigation,
+        )
+
+    def process_many(
+        self,
+        metrics: Iterable[str],
+        *,
+        at: datetime | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        scope: dict[str, str] | None = None,
+        quality: QualityReport | None = None,
+        preferred_leaves: tuple[str, ...] = (),
+        context: list[str] | None = None,
+    ) -> dict[str, ProcessResult]:
+        """Process several metrics sharing one EvaluationSession batch cache.
+
+        Prefer this over repeated :meth:`process` calls when metrics share
+        ``BatchCalculation`` sources for the same evaluation context.
+        """
+        from metric_runtime.calculations.session import build_evaluation_context
+
+        metric_ids = [str(m) for m in metrics]
+        session = self.new_evaluation_session()
+        # Warm the session-local batch cache for the primary evaluation window.
+        if at is not None or (start is not None and end is not None):
+            ctx = build_evaluation_context(at=at, start=start, end=end, filters=scope)
+            session.evaluate_all(metric_ids, ctx)
+
+        return {
+            metric_id: self.process(
+                metric_id,
+                at=at,
+                start=start,
+                end=end,
                 scope=scope,
-                evaluation_key=eval_key,
-                at=eval_at,
-                status=status,
-                transition=transition,
-                new_incidents=[
-                    i
-                    for iid in new_incident_ids
-                    if (i := self.state_store.get_incident(iid)) is not None
-                ],
-                updated_incidents=[
-                    i
-                    for iid in updated_incident_ids
-                    if (i := self.state_store.get_incident(iid)) is not None
-                ],
-                notifications=notifications,
-                investigation=investigation,
-                idempotent=False,
-                evaluation_record=record,
-                processed_at=now,
+                quality=quality,
+                preferred_leaves=preferred_leaves,
+                context=context,
+                session=session,
             )
-        finally:
-            self.state_store.release_evaluation_claim(eval_key, token=claim.token)
+            for metric_id in metric_ids
+        }
 
     # Alias used by schedulers / workers.
     tick = process

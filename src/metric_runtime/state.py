@@ -41,10 +41,15 @@ class StatePolicy:
     detections_before_open: int | None = None
     resolve_after_healthy_windows: int = 2
     cooldown_minutes: int = 30
-    min_impact_eur: float = 50.0
+    min_impact: float = 50.0
     require_support: bool = True
+    # Deprecated constructor alias — prefer ``min_impact``.
+    min_impact_eur: float | None = None
 
     def __post_init__(self) -> None:
+        if self.min_impact_eur is not None:
+            self.min_impact = float(self.min_impact_eur)
+        self.min_impact_eur = self.min_impact
         if self.detections_before_open is not None:
             self.persistence = self.detections_before_open
 
@@ -70,9 +75,15 @@ def observation_to_detection(status: KPIStatus) -> KPIState:
 
 
 def signals_from_history(history: list[StoredObservation]) -> list[StateSignal]:
-    """Convert stored observations into state-evolution signals."""
+    """Convert stored observations into state-evolution signals.
+
+    NO_DATA observations are skipped: a data gap neither breaks nor extends
+    detection / healthy streaks.
+    """
     signals: list[StateSignal] = []
     for item in history:
+        if getattr(item, "value_status", "value") == "no_data":
+            continue
         detected = bool(item.status.anomaly and item.status.support_ok)
         signals.append(
             StateSignal(
@@ -116,7 +127,8 @@ def evolve_state(
     history: list[KPIStatus] | list[StateSignal] | list[StoredObservation],
     *,
     policy: StatePolicy | None = None,
-    impact_eur: float = 0.0,
+    impact: float | None = None,
+    impact_eur: float | None = None,
     quality: QualityReport | None = None,
     previous: KPIState | None = None,
 ) -> KPIState:
@@ -131,6 +143,10 @@ def evolve_state(
     """
     policy = policy or StatePolicy()
     previous = previous or KPIState.NORMAL
+    if impact is None:
+        impact = 0.0 if impact_eur is None else float(impact_eur)
+    elif impact_eur is not None and impact_eur != impact:
+        raise ValueError("pass impact= or impact_eur=, not conflicting values")
 
     if quality is not None and not quality.healthy:
         return KPIState.SUPPRESSED
@@ -175,7 +191,7 @@ def evolve_state(
     if previous == KPIState.RESOLVED and streak > 0:
         if streak < policy.persistence:
             return KPIState.DETECTED
-        if impact_eur < policy.min_impact_eur:
+        if impact < policy.min_impact:
             return KPIState.DETECTED
         if policy.require_support and not last.support_ok:
             return KPIState.DETECTED
@@ -189,7 +205,7 @@ def evolve_state(
         return KPIState.NORMAL
     if streak < policy.persistence:
         return KPIState.DETECTED
-    if impact_eur < policy.min_impact_eur:
+    if impact < policy.min_impact:
         return KPIState.DETECTED
     if policy.require_support and not last.support_ok:
         return KPIState.DETECTED

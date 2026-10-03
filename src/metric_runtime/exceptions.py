@@ -27,6 +27,19 @@ class InsufficientSupportError(MetricRuntimeError):
     """Observation lacked enough support to treat as actionable."""
 
 
+class NoDataError(MetricRuntimeError):
+    """A calculation produced NO_DATA (no rows / NULL / missing inputs).
+
+    ``reason`` is ``"no_data"`` for the current window or ``"no_baseline"``
+    when no baseline window produced a value. ``KPIEngine.process()`` records
+    this as a committed NO_DATA evaluation instead of failing.
+    """
+
+    def __init__(self, message: str, *, reason: str = "no_data") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class ConfigurationError(MetricRuntimeError):
     """Project or connections configuration is invalid."""
 
@@ -45,6 +58,23 @@ class UnsupportedConnectionTypeError(ConfigurationError):
 
 class EvaluationInProgressError(MetricRuntimeError):
     """Another worker currently owns this EvaluationKey."""
+
+
+class StreamCommitConflict(EvaluationInProgressError):
+    """The stream changed between the ordered wait and the commit.
+
+    Raised by durable stores when, while holding the commit-time stream lock,
+    an earlier claim appeared or the metric-state version moved. The engine
+    re-enters the ordered section (bounded) and recomputes the transition.
+    """
+
+
+class NotificationLeaseLostError(MetricRuntimeError):
+    """An outbox write used a claim token that no longer holds the lease."""
+
+
+class RuntimeStoreNotMigratedError(ConfigurationError):
+    """The durable runtime store schema has pending migrations."""
 
 
 class StaleEvaluationError(MetricRuntimeError):

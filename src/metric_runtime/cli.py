@@ -49,7 +49,11 @@ def _cmd_config_show(args: argparse.Namespace) -> int:
 
 def _cmd_validate(args: argparse.Namespace) -> int:
     from metric_runtime.config.environment import find_env_placeholders
-    from metric_runtime.config.factory import load_catalog_entrypoint, resolve_profile
+    from metric_runtime.config.factory import (
+        load_catalog_entrypoint,
+        resolve_profile,
+        validate_profile_wiring,
+    )
     from metric_runtime.config.loader import (
         DEFAULT_CONNECTIONS_FILENAMES,
         _read_yaml,
@@ -81,8 +85,23 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     profile_name = args.profile or project.runtime.default_profile
     if connections is not None and connections.profiles:
         try:
-            resolve_profile(connections, profile_name, project)
+            profile_cfg = resolve_profile(connections, profile_name, project)
             print(f"profile: {profile_name}")
+            wiring_errors = validate_profile_wiring(profile_cfg, connections, check_fields=False)
+            errors.extend(f"profile {profile_name!r}: {err}" for err in wiring_errors)
+            if not wiring_errors:
+                store = profile_cfg.runtime_store
+                store_desc = store if isinstance(store, str) else "memory (inline)"
+                notifier = profile_cfg.notifier
+                notifier_desc = (
+                    notifier
+                    if isinstance(notifier, str)
+                    else (notifier.type if notifier is not None else "logging")
+                )
+                print(
+                    f"roles: metric_source={profile_cfg.metric_source or '-'} "
+                    f"runtime_store={store_desc} notifier={notifier_desc}"
+                )
         except MetricRuntimeError as exc:
             errors.append(str(exc))
     else:
@@ -119,6 +138,20 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     else:
         print("catalog: (none configured)")
 
+    schedules = project.runtime.schedules
+    if schedules:
+        known = set(catalog.ids()) if catalog is not None else set()
+        unknown = sorted(set(schedules) - known)
+        if unknown:
+            errors.append(f"runtime.schedules references unknown metric id(s): {unknown}")
+        disabled = sorted(m for m, s in schedules.items() if not s.enabled)
+        print(f"schedules: {len(schedules)} override(s), {len(disabled)} disabled")
+    print(
+        f"schedule: every {project.runtime.evaluation_interval} "
+        f"(lag {project.runtime.evaluation_lag}, "
+        f"catch-up {project.runtime.max_catchup_windows} window(s))"
+    )
+
     if errors:
         for err in errors:
             print(f"error: {err}", file=sys.stderr)
@@ -153,33 +186,197 @@ def _cmd_connections_test(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_run(args: argparse.Namespace) -> int:
+def _parse_timestamp(value: str, *, flag: str):
+    from datetime import UTC, datetime
+
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{flag} expects an ISO-8601 timestamp, got {value!r}") from exc
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _evaluate_one(args: argparse.Namespace, metric: str) -> int:
     from metric_runtime.config.factory import build_runtime
     from metric_runtime.exceptions import MetricRuntimeError
 
+    if not args.at:
+        print("error: pass --at ISO timestamp", file=sys.stderr)
+        return 1
     try:
+        at = _parse_timestamp(args.at, flag="--at")
         engine = build_runtime(
             args.profile,
             project_config=args.project_config,
             connections_config=args.connections,
         )
+    except (MetricRuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if engine.executor is None:
+        print("error: profile has no metric_source", file=sys.stderr)
+        return 1
+    try:
+        status = engine.evaluate(metric, at)
     except MetricRuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    print(
+        f"{status.name}: value={status.value:.4g} anomaly={status.anomaly} z={status.z_score:+.2f}"
+    )
+    return 0
 
-    print(f"engine ready · profile={args.profile} · metrics={len(engine.catalog)}")
-    if args.evaluate and engine.executor is not None:
-        from datetime import datetime
 
-        at = datetime.fromisoformat(args.at) if args.at else None
-        if at is None:
-            print("pass --at ISO timestamp with --evaluate")
-            return 1
-        status = engine.evaluate(args.evaluate, at)
+def _print_report(report) -> None:
+    print(f"run_once now={report.now.isoformat()} · {report.summary()}")
+    for outcome in report.outcomes:
+        line = f"  {outcome.status:<10} {outcome.metric} @ {outcome.at.isoformat()}"
+        if outcome.transition:
+            line += f" ({outcome.transition})"
+        if outcome.error and outcome.status == "failed":
+            line += f" error={outcome.error}"
+        print(line)
+    for metric, count in report.catchup_skipped.items():
+        print(f"  catch-up skipped {count} window(s) for {metric}")
+    if report.next_metric_due_at is not None:
+        print(f"next metric due at: {report.next_metric_due_at.isoformat()}")
+    if report.next_outbox_due_at is not None:
+        print(f"next outbox retry at: {report.next_outbox_due_at.isoformat()}")
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    from metric_runtime.config.factory import build_metric_runtime
+    from metric_runtime.exceptions import MetricRuntimeError
+
+    if args.evaluate:
         print(
-            f"{status.name}: value={status.value:.4g} "
-            f"anomaly={status.anomaly} z={status.z_score:+.2f}"
+            "note: 'run --evaluate' is deprecated; use 'metric-runtime evaluate METRIC --at TS'",
+            file=sys.stderr,
         )
+        return _evaluate_one(args, args.evaluate)
+    if args.now and not args.once:
+        print("error: --now is only valid with --once", file=sys.stderr)
+        return 1
+
+    try:
+        now = _parse_timestamp(args.now, flag="--now") if args.now else None
+        runtime = build_metric_runtime(
+            args.profile,
+            project_config=args.project_config,
+            connections_config=args.connections,
+        )
+    except (MetricRuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        runtime.ensure_ready()
+    except MetricRuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        runtime.close()
+        return 1
+
+    if args.once:
+        try:
+            report = runtime.run_once(now)
+        except MetricRuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            runtime.close()
+        if args.json:
+            print(json.dumps(report.to_dict(), indent=2))
+        else:
+            _print_report(report)
+        return 0 if report.ok else 1
+
+    import threading
+
+    from metric_runtime.runtime import install_signal_handlers
+
+    stop = threading.Event()
+    install_signal_handlers(stop)
+    print(
+        f"metric-runtime running · metrics={len(runtime.scheduled_metrics())} "
+        f"· idle_interval={runtime.schedule.idle_interval} (Ctrl+C to stop)",
+        file=sys.stderr,
+    )
+    runtime.run_forever(stop, max_cycles=args.max_cycles)
+    return 0
+
+
+def _cmd_evaluate(args: argparse.Namespace) -> int:
+    return _evaluate_one(args, args.metric)
+
+
+def _store_for(args: argparse.Namespace):
+    from metric_runtime.config.factory import build_profile_runtime_store
+
+    return build_profile_runtime_store(
+        args.profile,
+        project_config=args.project_config,
+        connections_config=args.connections,
+    )
+
+
+def _cmd_store_migrate(args: argparse.Namespace) -> int:
+    from metric_runtime.exceptions import MetricRuntimeError
+
+    try:
+        store, profile = _store_for(args)
+    except MetricRuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        migrate = getattr(store, "migrate", None)
+        if not callable(migrate):
+            print(f"profile {profile}: runtime store is in-memory; nothing to migrate")
+            return 0
+        applied = migrate()
+    except Exception as exc:  # noqa: BLE001 - surface DB errors without a traceback
+        print(f"error: migration failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+    schema = getattr(store, "schema", "?")
+    if applied:
+        for m in applied:
+            print(f"applied {m.filename}")
+        print(f"schema {schema}: {len(applied)} migration(s) applied")
+    else:
+        print(f"schema {schema}: up to date")
+    return 0
+
+
+def _cmd_store_status(args: argparse.Namespace) -> int:
+    from metric_runtime.exceptions import MetricRuntimeError
+
+    try:
+        store, profile = _store_for(args)
+    except MetricRuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        if not callable(getattr(store, "pending_migrations", None)):
+            print(f"profile {profile}: runtime store is in-memory (not durable)")
+            return 0
+        applied = store.applied_migrations()
+        pending = store.pending_migrations()
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+    print(f"profile: {profile}")
+    print(f"schema: {store.schema}")
+    for version, (name, _checksum) in sorted(applied.items()):
+        print(f"  applied {version:03d}_{name}")
+    for m in pending:
+        print(f"  pending {m.filename}")
+    if pending:
+        print(f"{len(pending)} pending migration(s): run 'metric-runtime store migrate'")
+        return 1 if args.check else 0
+    print("up to date")
     return 0
 
 
@@ -335,21 +532,30 @@ def build_parser() -> argparse.ArgumentParser:
         prog="metric-runtime",
         description=("Define, validate, execute and operationalize semantic business metrics."),
     )
+    # SUPPRESS so nested subcommands sharing these flags don't reset each other;
+    # main() fills in the defaults.
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument(
         "--project-config",
-        default=None,
+        default=argparse.SUPPRESS,
         help="Path to metric-runtime.yaml",
     )
     shared.add_argument(
         "--connections",
-        default=None,
+        default=argparse.SUPPRESS,
         help="Path to connections.yaml",
     )
     shared.add_argument(
         "--profile",
-        default="local",
-        help="Runtime profile name",
+        default=argparse.SUPPRESS,
+        help="Runtime profile name (default: runtime.default_profile)",
+    )
+    shared.add_argument(
+        "--log-level",
+        default=argparse.SUPPRESS,
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        type=str.upper,
+        help="Logging level (default: INFO for run, WARNING otherwise)",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -376,8 +582,28 @@ def build_parser() -> argparse.ArgumentParser:
     test = conn_sub.add_parser("test", help="Test connectivity for a profile", parents=[shared])
     test.set_defaults(func=_cmd_connections_test)
 
-    p_run = sub.add_parser("run", help="Build runtime from profile", parents=[shared])
-    p_run.add_argument("--evaluate", default=None, help="Optional metric id to evaluate")
+    p_run = sub.add_parser(
+        "run",
+        help="Evaluate due metrics and deliver notifications (continuous, or --once)",
+        parents=[shared],
+    )
+    p_run.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one cycle and exit (0 = all OK, 1 = a metric failed / config invalid)",
+    )
+    p_run.add_argument(
+        "--now",
+        default=None,
+        help="ISO timestamp to schedule against (with --once; default: current time)",
+    )
+    p_run.add_argument("--json", action="store_true", help="Print the --once report as JSON")
+    p_run.add_argument("--max-cycles", type=int, default=None, help=argparse.SUPPRESS)
+    p_run.add_argument(
+        "--evaluate",
+        default=None,
+        help="Deprecated: evaluate one metric (use 'metric-runtime evaluate')",
+    )
     p_run.add_argument("--at", default=None, help="ISO timestamp for --evaluate")
     p_run.set_defaults(func=_cmd_run)
 
@@ -385,6 +611,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("metric")
     p_eval.add_argument("--at", required=True)
     p_eval.set_defaults(func=_cmd_evaluate)
+
+    p_store = sub.add_parser("store", help="Runtime store operations", parents=[shared])
+    store_sub = p_store.add_subparsers(dest="store_command", required=True)
+    s_migrate = store_sub.add_parser(
+        "migrate", help="Apply pending runtime store migrations", parents=[shared]
+    )
+    s_migrate.set_defaults(func=_cmd_store_migrate)
+    s_status = store_sub.add_parser(
+        "status", help="Show applied / pending runtime store migrations", parents=[shared]
+    )
+    s_status.add_argument("--check", action="store_true", help="Exit 1 when migrations are pending")
+    s_status.set_defaults(func=_cmd_store_status)
 
     p_cat = sub.add_parser("catalog", help="Inspect / export the metric catalog", parents=[shared])
     cat_sub = p_cat.add_subparsers(dest="catalog_command", required=True)
@@ -422,14 +660,32 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _cmd_evaluate(args: argparse.Namespace) -> int:
-    args.evaluate = args.metric
-    return _cmd_run(args)
+_SHARED_DEFAULTS = {
+    "project_config": None,
+    "connections": None,
+    "profile": None,
+    "log_level": None,
+}
+
+
+def _configure_logging(args: argparse.Namespace) -> None:
+    import logging
+
+    level_name = args.log_level or ("INFO" if args.command == "run" else "WARNING")
+    logging.basicConfig(
+        level=getattr(logging, level_name.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    for key, value in _SHARED_DEFAULTS.items():
+        if not hasattr(args, key):
+            setattr(args, key, value)
+    _configure_logging(args)
     return int(args.func(args))
 
 

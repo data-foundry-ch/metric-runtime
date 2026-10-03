@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0] - Unreleased
 
+### Added — durable runtime
+
+- ``RuntimeStore`` protocol (``StateStore`` kept as alias) with an evaluation cursor
+  (``latest_committed_evaluation``), leased outbox API (``claim_pending_notifications``,
+  token-guarded ``mark_notification_delivered`` / ``record_notification_attempt``,
+  ``release_notification_claim``, ``next_notification_due_at``) and ``close()``;
+  ``InMemoryRuntimeStore`` alias
+- ``PostgresRuntimeStore`` (``pip install "metric-runtime[postgres]"``): leased evaluation
+  claims, non-locking ordered wait, commit under ``pg_advisory_xact_lock`` with
+  claim/duplicate/staleness/earlier-claim re-checks and a version-guarded state upsert,
+  outbox claims via ``UPDATE … FOR UPDATE SKIP LOCKED RETURNING``
+- Numbered SQL migrations (``001_initial.sql``) applied in one transaction under an advisory
+  lock, with ``schema_migrations`` checksums
+- ``MetricRuntime`` orchestration: cursor-driven due windows, per-tick shared
+  ``EvaluationSession``, per-metric failure isolation, outbox drain, ``RunReport``;
+  ``run_forever`` waking at the next metric window / outbox retry (capped by
+  ``idle_interval``), SIGINT/SIGTERM shutdown
+- ``metric_runtime.scheduling`` (``align_tick``, ``due_ticks``)
+- Outbox delivery policy: exponential backoff, ``max_attempts`` dead-lettering, leases
+  (``OutboxEvent.claim_token`` / ``claimed_until`` / ``dead_lettered_at``)
+- CLI: ``run --once [--now TS] [--json]``, continuous ``run``, ``--log-level``,
+  ``store migrate``, ``store status [--check]``; ``validate`` checks role wiring and
+  schedule metric ids
+- Config: ``runtime_store`` profile role, ``type: postgres`` connections,
+  ``runtime.evaluation_lag`` / ``max_catchup_windows`` / ``idle_interval`` / ``schedules`` /
+  ``notifications``; ``build_metric_runtime()``
+- NO_DATA is a committed evaluation outcome (state carried forward, no incidents/outbox,
+  ignored by streaks); NO_DATA baseline windows are excluded from the baseline
+- CI: Postgres 16 service, Postgres-backed tests and a production smoke run
+- Docs: rewritten ``docs/production.md``
+- ``WebhookNotifier`` (``type: webhook`` connections, stdlib only): JSON POST per outbox event
+  with ``Idempotency-Key: <event_key>``, optional ``X-Metric-Runtime-Signature: sha256=<hmac>``,
+  custom headers, timeout; redirects are not followed and errors never echo the URL
+- ``EventNotifier`` protocol (``notify_event(OutboxEvent)``): delivery receives the full event
+  including ``event_key``; plain ``Notifier`` implementations keep working
+- ``notifier`` profile role (webhook connection, or inline ``type: logging`` / ``type: none``)
+- ``PostgresExecutor`` (``metric_source`` role on ``type: postgres``): read-only sessions
+  (``default_transaction_read_only`` + ``READ ONLY`` transactions), ``statement_timeout``,
+  UTC session time zone, server-side parameter binding, SQL-pushed formula aggregates,
+  ``dialect: postgres`` SQL calculations and batch sources
+- ``metric_runtime.execution.sql``: shared identifier quoting and ``:name`` parameter binding
+- Validation rejects a profile whose ``runtime_store`` and ``metric_source`` resolve to the same
+  Postgres database **and** schema
+
+### Changed — durable runtime
+
+- ``KPIEngine(runtime_store=...)``; ``state_store=`` / ``.state_store`` remain aliases
+- ``KPIEngine.process()`` retries the ordered section up to 3 times on
+  ``StreamCommitConflict``; execution errors commit nothing
+- ``KPIEngine.deliver_notifications()`` uses the leased delivery path
+- CLI ``--profile`` defaults to ``runtime.default_profile``; ``run`` without flags now starts
+  the continuous runner (``run --evaluate`` still works but is deprecated in favour of
+  ``evaluate``)
+- ``${ENV}`` placeholders in ``connections.yaml`` are resolved per connection and only fail
+  when a profile uses that connection
+- ``config show`` redacts ``dsn``, ``url``, ``headers`` and ``authorization`` values
+- ``EvaluationSession`` accepts SQL dialects advertised by the executor
+  (``executor.sql_dialects``) instead of assuming ``duckdb``
+- ``DuckDBExecutor`` uses the shared ``execution.sql`` helpers (behaviour unchanged)
+
 ### Added
 
 - Canonical ``Metric`` model with stable ``id`` and display ``name``
@@ -19,12 +79,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``examples/company_metrics`` Python metric repository
 - Docs: ``metric-repositories.md``, ``product-integration.md``, ``migration-metric-model.md``, ADR 0002
 - Optional ``KPIObservation.metric_definition_hash`` provenance
+- ``KPIEngine.process_many()`` shares one ``EvaluationSession`` (batch cache) across metrics
+- Currency-agnostic ``estimate_impact`` / ``min_impact`` / ``impact`` (``*_eur`` aliases retained)
+- ``examples/judgment_comparison`` marimo demo: Metric Runtime evidence → Jev / LLM typed judgment → Python policy, including live cost comparison from pydantic-ai usage
+- ``examples/metric_judgment_eval`` experimental harness: deterministic ``GraphAnalysis`` + operational proposals, with Jev/OpenAI judged only on remaining sufficiency / human-review / disposition (no incident narratives)
 
 ### Changed
 
 - ``Metric.id`` is machine identity for dependencies, graph, observations, state, and incidents
+- ``Metric.calculation`` is a mandatory discriminated ``Calculation`` union; model is frozen
+- ``formula`` is authoring sugar only (excluded from serialized Metric output)
+- Metadata must be strictly JSON-safe (no silent ``default=str`` coercion)
 - Units are no longer a closed ``eur|percent|…`` enum
 - Version bump to **0.2.0**
+- CI matrix includes Python 3.13
 
 ### Deprecated
 

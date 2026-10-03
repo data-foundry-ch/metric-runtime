@@ -201,15 +201,18 @@ def test_ranking_without_preferred_leaves_picks_deeper_candidate():
                 name="weekend_profit",
                 owner="finance",
                 dependencies=("profit_margin",),
+                formula=Formula.sum("weekend_profit"),
             ),
             "profit_margin": KPI(
                 name="profit_margin",
                 owner="finance",
                 dependencies=("basket_threshold_concentration",),
+                formula=Formula.ratio("profit", "revenue"),
             ),
             "basket_threshold_concentration": KPI(
                 name="basket_threshold_concentration",
                 owner="commercial-growth",
+                formula=Formula.sum("basket"),
             ),
         }
 
@@ -482,7 +485,7 @@ def test_mark_delivered_failure_keeps_at_least_once_semantics():
 
     original = store.mark_notification_delivered
 
-    def fail_mark(event_id, *, at):
+    def fail_mark(event_id, *, at, claim_token=None):
         raise RuntimeError("ack failed after send")
 
     store.mark_notification_delivered = fail_mark  # type: ignore[method-assign]

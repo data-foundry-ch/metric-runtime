@@ -9,7 +9,28 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: metric_runtime_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Enables the Postgres cases of the runtime-store contract/migration/CLI tests.
+      METRIC_RUNTIME_TEST_POSTGRES_DSN: postgresql://postgres:postgres@localhost:5432/metric_runtime_test
+      # Used by the pypizza "production" profile in the smoke steps.
+      METRIC_RUNTIME_POSTGRES_DSN: postgresql://postgres:postgres@localhost:5432/metric_runtime_test
 
     steps:
       - uses: actions/checkout@v4
@@ -22,12 +43,12 @@ jobs:
       - name: Install package
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[demo,dev]"
+          pip install -e ".[demo,dev,postgres]"
 
       - name: Lint
         run: |
-          ruff check src tests examples/pypizza
-          ruff format --check src tests examples/pypizza
+          ruff check src tests examples/pypizza examples/judgment_comparison examples/metric_judgment_eval
+          ruff format --check src tests examples/pypizza examples/judgment_comparison examples/metric_judgment_eval
 
       - name: Type check
         run: mypy src/metric_runtime
@@ -48,3 +69,25 @@ jobs:
             --project-config examples/pypizza/metric-runtime.yaml \
             --connections examples/pypizza/connections.yaml \
             --profile local
+
+      - name: Production smoke (Postgres runtime store)
+        run: |
+          ARGS="--project-config examples/pypizza/metric-runtime.yaml --connections examples/pypizza/connections.yaml --profile production"
+          metric-runtime validate $ARGS
+          metric-runtime store migrate $ARGS
+          metric-runtime store status --check $ARGS
+          metric-runtime run --once --now 2026-05-15T13:00:00Z $ARGS
+          # Second process: the committed cursor survives, nothing is re-evaluated.
+          metric-runtime run --once --now 2026-05-15T13:00:00Z --json $ARGS \
+            | python -c "import json,sys; r=json.load(sys.stdin); assert r['ok'] and r['outcomes'] == [], r"
+
+      - name: Marimo check (judgment comparison, fixture-only)
+        run: |
+          python -c "import marimo, inspect; print(getattr(marimo, '__version__', 'unknown'))"
+          if marimo check --help >/dev/null 2>&1; then
+            marimo check examples/judgment_comparison/app.py
+            marimo check examples/metric_judgment_eval/app.py
+          else
+            python -c "import ast; ast.parse(open('examples/judgment_comparison/app.py', encoding='utf-8').read())"
+            python -c "import ast; ast.parse(open('examples/metric_judgment_eval/app.py', encoding='utf-8').read())"
+          fi

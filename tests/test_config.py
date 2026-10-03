@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -141,3 +142,161 @@ def test_config_show_redacts(tmp_path: Path):
 def test_project_config_model_defaults():
     cfg = MetricRuntimeProjectConfig()
     assert cfg.runtime.default_profile == "local"
+    assert cfg.runtime.evaluation_lag == "0m"
+    assert cfg.runtime.max_catchup_windows == 1
+    assert cfg.runtime.idle_interval == "5m"
+    assert cfg.runtime.schedules == {}
+    assert cfg.runtime.notifications.max_attempts == 10
+
+
+def test_runtime_schedule_config_parses():
+    from metric_runtime.runtime import RuntimeSchedule
+
+    cfg = MetricRuntimeProjectConfig.model_validate(
+        {
+            "runtime": {
+                "evaluation_interval": "30m",
+                "evaluation_lag": "5m",
+                "max_catchup_windows": 4,
+                "idle_interval": "2m",
+                "schedules": {
+                    "orders": {"evaluation_interval": "1h"},
+                    "legacy": {"enabled": False},
+                },
+                "notifications": {"max_attempts": 3, "backoff_initial": "10s", "lease": "1m"},
+            }
+        }
+    )
+    schedule = RuntimeSchedule.from_config(cfg.runtime)
+    assert schedule.default_interval == timedelta(minutes=30)
+    assert schedule.lag == timedelta(minutes=5)
+    assert schedule.max_catchup_windows == 4
+    assert schedule.idle_interval == timedelta(minutes=2)
+    assert schedule.interval_for("orders") == timedelta(hours=1)
+    assert schedule.interval_for("revenue") == timedelta(minutes=30)
+    assert not schedule.is_enabled("legacy")
+    assert schedule.is_enabled("orders")
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        {"evaluation_interval": "0m"},
+        {"idle_interval": "0s"},
+        {"max_catchup_windows": 0},
+        {"evaluation_lag": "soon"},
+        {"notifications": {"lease": "0m"}},
+        {"notifications": {"max_attempts": 0}},
+        {"schedules": {"orders": {"evaluation_interval": "0h"}}},
+    ],
+)
+def test_invalid_runtime_config_rejected(runtime):
+    with pytest.raises(ValidationError):
+        MetricRuntimeProjectConfig.model_validate({"runtime": runtime})
+
+
+def test_state_store_is_alias_for_runtime_store():
+    from metric_runtime.config.models import ProfileConfig
+
+    legacy = ProfileConfig.model_validate({"state_store": "db"})
+    assert legacy.runtime_store == "db"
+    both = ProfileConfig.model_validate({"state_store": "db", "runtime_store": "db"})
+    assert both.runtime_store == "db"
+    with pytest.raises(ValidationError, match="runtime_store"):
+        ProfileConfig.model_validate({"state_store": "a", "runtime_store": "b"})
+
+
+def test_postgres_connection_config():
+    from metric_runtime.config.models import PostgresConnectionConfig
+
+    cfg = PostgresConnectionConfig.model_validate(
+        {
+            "type": "postgres",
+            "host": "db.internal",
+            "database": "ops",
+            "user": "runtime",
+            "password": "s3cret",
+            "sslmode": "require",
+            "schema": "mr_prod",
+        }
+    )
+    assert cfg.schema_name == "mr_prod"
+    assert cfg.conninfo() == ""
+    kwargs = cfg.connect_kwargs()
+    assert kwargs["host"] == "db.internal" and kwargs["dbname"] == "ops"
+    assert kwargs["password"] == "s3cret" and kwargs["sslmode"] == "require"
+    assert "s3cret" not in repr(cfg)
+
+    dsn = PostgresConnectionConfig.model_validate({"dsn": "postgresql://u:pw@h/db"})
+    assert dsn.conninfo() == "postgresql://u:pw@h/db"
+    assert "pw@" not in repr(dsn)
+
+    with pytest.raises(ValidationError, match="dsn"):
+        PostgresConnectionConfig.model_validate({"host": "h"})
+    with pytest.raises(ValidationError):
+        PostgresConnectionConfig.model_validate({"dsn": "x", "schema": "bad-name;drop"})
+
+
+def test_build_runtime_store_roles(tmp_path: Path):
+    from metric_runtime.config.factory import build_runtime_store, validate_profile_wiring
+
+    path = tmp_path / "connections.yaml"
+    path.write_text(
+        "connections:\n"
+        "  src:\n    type: duckdb\n    path: ./x.duckdb\n"
+        "  mem:\n    type: memory\n"
+        "  pg:\n    type: postgres\n    dsn: ${PG_DSN_NOT_SET_FOR_TEST}\n"
+        "profiles:\n"
+        "  ok:\n    metric_source: src\n    runtime_store: mem\n"
+        "  inline:\n    metric_source: src\n"
+        "  wrong_store:\n    runtime_store: src\n"
+        "  pg_source:\n    metric_source: pg\n"
+        "  missing:\n    runtime_store: nope\n",
+        encoding="utf-8",
+    )
+    cfg, _ = load_connections_config(path, env={})
+    assert isinstance(build_runtime_store(cfg.profiles["ok"], cfg), InMemoryStateStore)
+    assert isinstance(build_runtime_store(cfg.profiles["inline"], cfg), InMemoryStateStore)
+    assert validate_profile_wiring(cfg.profiles["ok"], cfg) == []
+    assert "analytical source only" in validate_profile_wiring(cfg.profiles["wrong_store"], cfg)[0]
+    # Postgres is a valid source; this one fails only because its env var is unset.
+    pg_errors = validate_profile_wiring(cfg.profiles["pg_source"], cfg)
+    assert "PG_DSN_NOT_SET_FOR_TEST" in pg_errors[0]
+    assert validate_profile_wiring(cfg.profiles["pg_source"], cfg, check_fields=False) == []
+    assert "unknown connection" in validate_profile_wiring(cfg.profiles["missing"], cfg)[0]
+    # The unresolved env var only matters when a profile uses that connection.
+    with pytest.raises(MissingEnvironmentVariableError, match="PG_DSN_NOT_SET_FOR_TEST"):
+        cfg.get_connection("pg")
+
+
+def test_config_show_redacts_dsn(tmp_path: Path):
+    path = tmp_path / "connections.yaml"
+    path.write_text(
+        "connections:\n  rt:\n    type: postgres\n    dsn: postgresql://u:leaky@h/db\n"
+        "profiles:\n  production:\n    runtime_store: rt\n",
+        encoding="utf-8",
+    )
+    project = tmp_path / "metric-runtime.yaml"
+    project.write_text("runtime:\n  default_profile: production\n", encoding="utf-8")
+    shown = show_resolved_config(None, project_config=project, connections_config=path)
+    assert shown["profile"] == "production"
+    assert "leaky" not in str(shown)
+
+
+def test_build_metric_runtime_from_profile():
+    db = PYPIZZA / "data" / "pypizza.duckdb"
+    if not db.exists():
+        pytest.skip("pypizza.duckdb missing — run generate_data.py")
+    from metric_runtime.config.factory import build_metric_runtime
+
+    runtime = build_metric_runtime(
+        None,
+        project_config=PYPIZZA / "metric-runtime.yaml",
+        connections_config=PYPIZZA / "connections.yaml",
+    )
+    try:
+        assert runtime.schedule.default_interval == timedelta(minutes=30)
+        assert len(runtime.scheduled_metrics()) == len(runtime.engine.catalog)
+        assert runtime.engine.notification_policy.max_attempts == 10
+    finally:
+        runtime.close()

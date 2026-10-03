@@ -42,7 +42,7 @@ def incident_from_investigation(
         opened_at=stamp if state == IncidentState.OPEN else None,
         updated_at=stamp,
         first_detected=ensure_utc(first_detected),
-        estimated_impact=max(estimated_impact, inv.impact_eur),
+        estimated_impact=max(estimated_impact, inv.impact),
         evidence=list(path),
         related_metrics=list(suppressed),
         supporting_metrics=list(suppressed),
@@ -61,7 +61,8 @@ def open_smart_incident(
     windows: int = 12,
     interval_minutes: int = 30,
     persistence: int = 2,
-    min_impact_eur: float = 50.0,
+    min_impact: float | None = None,
+    min_impact_eur: float | None = None,
     quality: QualityReport | None = None,
     preferred_leaves: tuple[str, ...] = (),
     context: list[str] | None = None,
@@ -76,6 +77,13 @@ def open_smart_incident(
     if quality is not None and not quality.healthy:
         return None
 
+    threshold = (
+        50.0
+        if min_impact is None and min_impact_eur is None
+        else float(
+            min_impact if min_impact is not None else min_impact_eur  # type: ignore[arg-type]
+        )
+    )
     scope = dict(scope or {})
     consecutive = 0
     first_detected: datetime | None = None
@@ -85,10 +93,8 @@ def open_smart_incident(
     for i in range(windows):
         at = start + timedelta(minutes=interval_minutes * i)
         status = engine.evaluate(center_kpi, at, scope)
-        impact = engine.estimate_impact_eur(
-            center_kpi, at, status.value, status.baseline_mean, scope
-        )
-        if status.anomaly and status.support_ok and impact >= min_impact_eur:
+        impact = engine.estimate_impact(center_kpi, at, status.value, status.baseline_mean, scope)
+        if status.anomaly and status.support_ok and impact >= threshold:
             consecutive += 1
             if first_detected is None:
                 first_detected = at
@@ -136,7 +142,8 @@ def evaluate_watcher(
     interval_minutes: int = 30,
     windows: int = 48,
     persistence: int = 2,
-    min_impact_eur: float = 50.0,
+    min_impact: float | None = None,
+    min_impact_eur: float | None = None,
     quality: QualityReport | None = None,
     preferred_leaves: tuple[str, ...] = (),
     context: list[str] | None = None,
@@ -150,6 +157,7 @@ def evaluate_watcher(
         windows=windows,
         interval_minutes=interval_minutes,
         persistence=persistence,
+        min_impact=min_impact,
         min_impact_eur=min_impact_eur,
         quality=quality,
         preferred_leaves=preferred_leaves,

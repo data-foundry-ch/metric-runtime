@@ -9,16 +9,16 @@ application/example layer — not here.
 
 from __future__ import annotations
 
-import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from metric_runtime.exceptions import MetricRuntimeError
+from metric_runtime.execution.sql import bind_named_params, quote_identifier, quote_relation
 from metric_runtime.identity import ensure_utc
 from metric_runtime.models import Formula, MeasureRef, coerce_measure_ref
 
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+__all__ = ["DuckDBExecutor", "quote_identifier", "quote_relation"]
 
 
 def _bind_timestamp(value: datetime) -> datetime:
@@ -36,32 +36,6 @@ def _from_duckdb_timestamp(value: datetime | str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return ensure_utc(parsed)
-
-
-def quote_identifier(name: str) -> str:
-    """Validate and double-quote a SQL identifier.
-
-    Rejects anything that is not a plain identifier so user-controlled
-    strings cannot alter generated SQL structure.
-    """
-    if not isinstance(name, str) or not _IDENT_RE.fullmatch(name):
-        raise ValueError(
-            f"Invalid SQL identifier {name!r}. Expected a name like 'orders' or 'gross_revenue'."
-        )
-    return f'"{name}"'
-
-
-def quote_relation(name: str) -> str:
-    """Validate and quote a table reference (optionally schema-qualified)."""
-    if not isinstance(name, str) or not name:
-        raise ValueError(f"Invalid relation name {name!r}.")
-    parts = name.split(".")
-    if any(not _IDENT_RE.fullmatch(part) for part in parts):
-        raise ValueError(
-            f"Invalid relation name {name!r}. "
-            "Expected 'table' or 'schema.table' with plain identifiers."
-        )
-    return ".".join(quote_identifier(part) for part in parts)
 
 
 def _require_duckdb() -> Any:
@@ -351,9 +325,6 @@ class DuckDBExecutor:
             )
 
 
-_PARAM_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
-
-
 def _normalize_sql_params(
     query: str,
     parameters: dict[str, Any],
@@ -363,15 +334,9 @@ def _normalize_sql_params(
     Only parameters referenced by the query are bound — DuckDB rejects excess
     named parameters.
     """
-    names = list(dict.fromkeys(_PARAM_RE.findall(query)))
-    sql = _PARAM_RE.sub(r"$\1", query)
-    bound: dict[str, Any] = {}
-    for name in names:
-        if name not in parameters:
-            raise MetricRuntimeError(f"Missing SQL parameter: {name!r}")
-        value = parameters[name]
-        if isinstance(value, datetime):
-            bound[name] = _bind_timestamp(value)
-        else:
-            bound[name] = value
-    return sql, bound
+    return bind_named_params(
+        query,
+        parameters,
+        placeholder=r"$\1",
+        convert=lambda v: _bind_timestamp(v) if isinstance(v, datetime) else v,
+    )

@@ -4,44 +4,32 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import warnings
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
+    ConfigDict,
     Field,
     field_validator,
     model_validator,
 )
 
+from metric_runtime.calculations.specs import (
+    BatchCalculation,
+    DerivedCalculation,
+    FormulaCalculation,
+    SqlCalculation,
+    coerce_calculation,
+)
 from metric_runtime.detectors.policy import SeasonalZScore, Threshold
 from metric_runtime.identity import EvaluationKey, parse_datetime
 from metric_runtime.ids import MetricId, validate_metric_id
+from metric_runtime.measures import Formula, MeasureRef, coerce_measure_ref
 from metric_runtime.units import UnitSpec, coerce_unit
-
-_MEASURE_REF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def coerce_measure_ref(value: Any) -> str:
-    """Normalize enums / strings into a generic measure identifier."""
-    if isinstance(value, Enum):
-        value = value.value
-    if not isinstance(value, str):
-        raise TypeError(f"Measure reference must be a string, got {type(value)!r}")
-    name = value.strip()
-    if not _MEASURE_REF_RE.match(name):
-        raise ValueError(
-            f"Invalid measure reference {name!r}. "
-            "Expected an identifier like 'orders' or 'gross_revenue'."
-        )
-    return name
-
-
-# Public alias: validated measure identifier (not a framework-owned domain enum).
-MeasureRef = str
 
 
 class Directionality(str, Enum):
@@ -66,54 +54,6 @@ class KPIState(str, Enum):
 
 # Back-compat alias used by older call sites / talk material.
 MetricState = KPIState
-
-
-class Formula(BaseModel):
-    """How a KPI is calculated from generic measure references."""
-
-    kind: Literal["sum", "ratio", "difference"]
-    measure: MeasureRef | None = None
-    numerator: MeasureRef | None = None
-    denominator: MeasureRef | None = None
-    left: MeasureRef | None = None
-    right: MeasureRef | None = None
-
-    @field_validator("measure", "numerator", "denominator", "left", "right", mode="before")
-    @classmethod
-    def _coerce_refs(cls, value: Any) -> Any:
-        if value is None:
-            return None
-        return coerce_measure_ref(value)
-
-    @model_validator(mode="after")
-    def validate_shape(self) -> Formula:
-        if self.kind == "sum" and self.measure is None:
-            raise ValueError("sum formulas require measure")
-        if self.kind == "ratio" and (self.numerator is None or self.denominator is None):
-            raise ValueError("ratio formulas require numerator and denominator")
-        if self.kind == "difference" and (self.left is None or self.right is None):
-            raise ValueError("difference formulas require left and right")
-        return self
-
-    @classmethod
-    def sum(cls, measure: str | Enum) -> Formula:
-        return cls(kind="sum", measure=coerce_measure_ref(measure))
-
-    @classmethod
-    def ratio(cls, numerator: str | Enum, denominator: str | Enum) -> Formula:
-        return cls(
-            kind="ratio",
-            numerator=coerce_measure_ref(numerator),
-            denominator=coerce_measure_ref(denominator),
-        )
-
-    @classmethod
-    def difference(cls, left: str | Enum, right: str | Enum) -> Formula:
-        return cls(
-            kind="difference",
-            left=coerce_measure_ref(left),
-            right=coerce_measure_ref(right),
-        )
 
 
 class DetectorConfig(BaseModel):
@@ -172,6 +112,28 @@ def _canonical_json_bytes(payload: Any) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
 
 
+def _assert_json_safe(value: Any, *, path: str = "metadata") -> Any:
+    """Reject values that are not strict JSON scalars/containers."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (str, int, float)):
+        if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+            raise ValueError(f"{path} contains non-JSON float {value!r}")
+        return value
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} keys must be strings, got {type(key)!r}")
+            out[key] = _assert_json_safe(item, path=f"{path}.{key}")
+        return out
+    if isinstance(value, list):
+        return [_assert_json_safe(item, path=f"{path}[]") for item in value]
+    raise ValueError(
+        f"{path} must be JSON-serializable (str|int|float|bool|None|list|dict), got {type(value)!r}"
+    )
+
+
 class Metric(BaseModel):
     """Canonical semantic metric definition.
 
@@ -182,15 +144,21 @@ class Metric(BaseModel):
     belong here — wrap ``Metric`` in a product model instead.
     """
 
+    model_config = ConfigDict(frozen=True)
+
     id: MetricId
     name: str = ""
     description: str = ""
     owner: str = ""
-    calculation: Any = Field(
+    calculation: Annotated[
+        FormulaCalculation | SqlCalculation | BatchCalculation | DerivedCalculation,
+        Field(discriminator="kind"),
+    ]
+    formula: Formula | None = Field(
         default=None,
-        description="Discriminated Formula|SQL|Batch|Derived calculation",
+        exclude=True,
+        description="Authoring sugar for FormulaCalculation; excluded from serialization.",
     )
-    formula: Formula | None = None
     dimensions: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
     directionality: Directionality = Directionality.TWO_SIDED
@@ -231,6 +199,25 @@ class Metric(BaseModel):
             label = payload.pop("label")
             if not payload.get("name"):
                 payload["name"] = label
+
+        metric_id = payload.get("id")
+        if not payload.get("name") and isinstance(metric_id, str) and metric_id:
+            payload["name"] = metric_id.replace("_", " ").title()
+
+        # formula= sugar → FormulaCalculation when calculation omitted.
+        if payload.get("calculation") is None and payload.get("formula") is not None:
+            payload["calculation"] = FormulaCalculation(formula=payload["formula"])
+        elif payload.get("calculation") is None:
+            raise ValueError("Metric requires calculation= (or formula= sugar)")
+
+        # Keep in-memory formula mirror for FormulaCalculation (not serialized).
+        calc = payload.get("calculation")
+        if payload.get("formula") is None:
+            if isinstance(calc, FormulaCalculation):
+                payload["formula"] = calc.formula
+            elif isinstance(calc, dict) and calc.get("kind", "formula") == "formula":
+                if "formula" in calc:
+                    payload["formula"] = calc["formula"]
         return payload
 
     @field_validator("unit", mode="before")
@@ -271,34 +258,22 @@ class Metric(BaseModel):
     @field_validator("calculation", mode="before")
     @classmethod
     def _coerce_calculation(cls, value: Any) -> Any:
-        from metric_runtime.calculations.specs import coerce_calculation
-
         return coerce_calculation(value)
 
     @field_validator("metadata")
     @classmethod
     def _json_safe_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        try:
-            json.dumps(value, default=str)
-        except TypeError as exc:
-            raise ValueError(f"metadata must be JSON-serializable: {exc}") from exc
-        return value
+        if not isinstance(value, dict):
+            raise ValueError("metadata must be a dict")
+        return _assert_json_safe(value)
 
     @model_validator(mode="after")
-    def _defaults(self) -> Metric:
-        from metric_runtime.calculations.specs import FormulaCalculation
-
-        if not self.name:
-            object.__setattr__(self, "name", self.id.replace("_", " ").title())
-
-        # Canonicalize: calculation is authoritative; formula is sugar.
-        if self.calculation is None and self.formula is not None:
-            object.__setattr__(self, "calculation", FormulaCalculation(formula=self.formula))
-        elif isinstance(self.calculation, FormulaCalculation):
-            if self.formula is None:
-                object.__setattr__(self, "formula", self.calculation.formula)
-            elif self.formula != self.calculation.formula:
+    def _check_formula_alignment(self) -> Metric:
+        if isinstance(self.calculation, FormulaCalculation):
+            if self.formula is not None and self.formula != self.calculation.formula:
                 raise ValueError(f"Metric {self.id!r}: formula and calculation.formula disagree")
+        elif self.formula is not None:
+            raise ValueError(f"Metric {self.id!r}: formula= is only valid with FormulaCalculation")
         return self
 
     @property
@@ -333,9 +308,7 @@ class Metric(BaseModel):
         """Fields that affect executable / routing semantics."""
         return {
             "id": self.id,
-            "calculation": (
-                self.calculation.model_dump(mode="json") if self.calculation is not None else None
-            ),
+            "calculation": self.calculation.model_dump(mode="json"),
             "dependencies": list(self.dependencies),
             "dimensions": list(self.dimensions),
             "unit": self.unit.model_dump(mode="json"),
@@ -476,11 +449,16 @@ class KPIStatus(BaseModel):
     root_candidate: bool = False
     state: KPIState = KPIState.NORMAL
     severity: float = 0.0
+    value_status: str = "value"
 
     @field_validator("as_of", mode="before")
     @classmethod
     def _coerce_as_of(cls, value: Any) -> datetime:
         return parse_datetime(value)
+
+    @property
+    def is_no_data(self) -> bool:
+        return self.value_status == "no_data"
 
     def to_observation(self, filters: dict[str, str] | None = None) -> KPIObservation:
         return KPIObservation(
@@ -513,6 +491,12 @@ class StoredObservation(BaseModel):
     eligible_for_state: bool = True
     quality_healthy: bool | None = None
     recorded_at: datetime
+    value_status: str = "value"
+    no_data_reason: str | None = None
+
+    @property
+    def is_no_data(self) -> bool:
+        return self.value_status == "no_data"
 
     @field_validator("recorded_at", mode="before")
     @classmethod
@@ -579,6 +563,8 @@ class KPIStateTransition(BaseModel):
 
 
 class DrilldownRow(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     filters: dict[str, str]
     value: float
     baseline_mean: float
@@ -586,16 +572,27 @@ class DrilldownRow(BaseModel):
     z_score: float
     anomaly: bool
     support: float
-    impact_eur: float
+    impact: float = Field(validation_alias=AliasChoices("impact", "impact_eur"))
+
+    @property
+    def impact_eur(self) -> float:
+        """Deprecated alias for ``impact`` (currency-agnostic)."""
+        return self.impact
 
 
 class ExplanatoryCandidate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     name: str
     owner: str
     depth: int
     status: KPIStatus
-    impact_eur: float
+    impact: float = Field(validation_alias=AliasChoices("impact", "impact_eur"))
     score: float
+
+    @property
+    def impact_eur(self) -> float:
+        return self.impact
 
 
 class InvestigationResult(BaseModel):
@@ -605,6 +602,8 @@ class InvestigationResult(BaseModel):
     the semantic graph — not proven causality.
     """
 
+    model_config = ConfigDict(populate_by_name=True)
+
     metric: str
     anomalous_metrics: list[KPIStatus]
     normal_dependencies: list[str]
@@ -612,7 +611,11 @@ class InvestigationResult(BaseModel):
     explanatory_paths: list[list[str]]
     deepest_candidates: list[ExplanatoryCandidate]
     primary_explanatory: ExplanatoryCandidate | None = None
-    impact_eur: float = 0.0
+    impact: float = Field(default=0.0, validation_alias=AliasChoices("impact", "impact_eur"))
+
+    @property
+    def impact_eur(self) -> float:
+        return self.impact
 
     @property
     def start_metric(self) -> str:
@@ -624,6 +627,8 @@ class InvestigationResult(BaseModel):
 
 
 class DimensionStep(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     scope: dict[str, str]
     value: float
     baseline_mean: float
@@ -631,7 +636,11 @@ class DimensionStep(BaseModel):
     z_score: float
     anomaly: bool
     support: float
-    impact_eur: float
+    impact: float = Field(validation_alias=AliasChoices("impact", "impact_eur"))
+
+    @property
+    def impact_eur(self) -> float:
+        return self.impact
 
 
 class QualityReport(BaseModel):
@@ -712,12 +721,17 @@ class OutboxEvent(BaseModel):
     last_attempt_at: datetime | None = None
     last_error: str | None = None
     next_attempt_at: datetime | None = None
+    claim_token: str | None = None
+    claimed_until: datetime | None = None
+    dead_lettered_at: datetime | None = None
 
     @field_validator(
         "created_at",
         "delivered_at",
         "last_attempt_at",
         "next_attempt_at",
+        "claimed_until",
+        "dead_lettered_at",
         mode="before",
     )
     @classmethod
@@ -728,7 +742,7 @@ class OutboxEvent(BaseModel):
 
     @property
     def pending(self) -> bool:
-        return self.delivered_at is None
+        return self.delivered_at is None and self.dead_lettered_at is None
 
 
 # Back-compat alias used by ProcessResult / older call sites.

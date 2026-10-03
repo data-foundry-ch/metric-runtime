@@ -3,7 +3,15 @@
 # Semantics live with the project (metric-runtime.yaml).
 # Connections live with the environment (this file).
 #
-# DO NOT commit real credentials. Prefer environment-variable placeholders.
+# Roles per profile:
+#   metric_source  — analytical source the metrics are calculated from (read-only)
+#   runtime_store  — where metric-runtime keeps its conclusions: observations,
+#                    metric state, evaluations, incidents, notification outbox
+#                    (`state_store` is accepted as a deprecated alias)
+#   notifier       — delivers outbox events (default: logging)
+#
+# DO NOT commit real credentials. Prefer environment-variable placeholders;
+# a missing variable only fails when a profile actually uses that connection.
 
 connections:
   local_analytics:
@@ -12,7 +20,39 @@ connections:
     fact_table: pypizza_halfhourly
     read_only: true
 
-  # --- Future adapters (NOT implemented in v0.1) ---
+  # Durable runtime store. Apply the schema with:
+  #   metric-runtime store migrate --profile production
+  runtime_db:
+    type: postgres
+    host: ${RUNTIME_DB_HOST}
+    port: 5432
+    database: metric_runtime
+    user: ${RUNTIME_DB_USER}
+    password: ${RUNTIME_DB_PASSWORD}
+    sslmode: require
+    schema: metric_runtime       # dedicated schema for runtime tables
+    claim_ttl: 15m               # crashed workers' evaluation claims expire after this
+    # Alternatively: dsn: ${RUNTIME_DB_DSN}
+
+  # Postgres as the analytical source (read-only sessions). If it shares a
+  # database with runtime_db, the schemas must differ.
+  analytics_db:
+    type: postgres
+    dsn: ${ANALYTICS_DB_DSN}
+    fact_table: analytics.facts  # schema-qualified; used by formula metrics
+    timestamp_column: ts
+    statement_timeout: 30s
+
+  # Outbox delivery: one JSON POST per event, Idempotency-Key = event_key.
+  ops_webhook:
+    type: webhook
+    url: ${METRIC_RUNTIME_WEBHOOK_URL}
+    secret: ${METRIC_RUNTIME_WEBHOOK_SECRET}  # optional HMAC-SHA256 signature
+    timeout: 10
+    # headers:
+    #   Authorization: Bearer ${WEBHOOK_TOKEN}
+
+  # --- Future adapters (NOT implemented yet) ---
   # production_warehouse:
   #   type: snowflake
   #   account: ${SNOWFLAKE_ACCOUNT}
@@ -21,21 +61,18 @@ connections:
   #   warehouse: MONITORING_WH
   #   user: ${SNOWFLAKE_USER}
   #   password: ${SNOWFLAKE_PASSWORD}
-  #
-  # operational_state:
-  #   type: postgres
-  #   host: ${STATE_DB_HOST}
-  #   port: 5432
-  #   database: metric_runtime
-  #   user: ${STATE_DB_USER}
-  #   password: ${STATE_DB_PASSWORD}
 
 profiles:
   local:
     metric_source: local_analytics
-    state_store:
+    runtime_store:
       type: memory
 
-  # production:
-  #   metric_source: production_warehouse
-  #   state_store: operational_state
+  production:
+    metric_source: local_analytics
+    runtime_store: runtime_db
+    notifier: ops_webhook
+
+  warehouse_pg:
+    metric_source: analytics_db
+    runtime_store: runtime_db

@@ -19,7 +19,7 @@ from metric_runtime.models import (
 
 
 def test_kpi_display_name_default():
-    k = KPI(name="profit_margin", owner="finance")
+    k = KPI(name="profit_margin", owner="finance", formula=Formula.sum("profit"))
     assert k.id == "profit_margin"
     assert k.display_name == "Profit Margin"
 
@@ -35,11 +35,14 @@ def test_kpi_json_round_trip():
         metadata={"presentation": {"graph_ring": 1, "graph_side": "marketing"}},
     )
     encoded = metric.model_dump_json()
+    assert '"formula"' not in encoded or '"formula":' not in encoded.split("calculation")[0]
     restored = KPI.model_validate_json(encoded)
-    assert restored == metric
+    assert restored.id == metric.id
+    assert restored.calculation == metric.calculation
+    assert restored.detector == metric.detector
+    assert restored.formula == metric.calculation.formula
     assert isinstance(restored.detector, SeasonalZScore)
     assert restored.detector.threshold == 3.0
-    assert restored.id == "conversion_rate"
 
 
 def test_kpi_json_round_trip_threshold_detector():
@@ -50,7 +53,8 @@ def test_kpi_json_round_trip_threshold_detector():
         detector=Threshold(absolute_threshold=0.05, min_relative_change=0.0),
     )
     restored = KPI.model_validate_json(metric.model_dump_json())
-    assert restored == metric
+    assert restored.id == metric.id
+    assert restored.calculation == metric.calculation
     assert isinstance(restored.detector, Threshold)
 
 

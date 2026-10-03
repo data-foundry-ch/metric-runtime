@@ -94,9 +94,12 @@ KPI definitions do **not** contain database credentials or infrastructure detail
 A `MetricExecutor` calculates formula observations from a resource.
 SQL/batch calculations use the executor's scalar/row SQL interface when present.
 
-`DuckDBExecutor` is the v0.1 analytical backend. It can run SQL/batch-only
-sessions without a designated `fact_table`; formula/measure aggregation still
-requires one. Future backends (Snowflake, BigQuery, …) should plug in without
+`DuckDBExecutor` and `PostgresExecutor` are the analytical backends. Both can
+run SQL/batch-only sessions without a designated `fact_table`; formula/measure
+aggregation still requires one. `PostgresExecutor` uses read-only sessions with
+a statement timeout. An executor advertises the SQL dialects it accepts
+(`sql_dialects`); the evaluation session rejects calculations in any other
+dialect. Future backends (Snowflake, BigQuery, …) should plug in without
 changing KPI semantics. Metric Runtime does **not** transpile SQL across dialects.
 
 ## 3. Observations
@@ -148,17 +151,58 @@ useful explanatory KPI, not the owner of the top-level red number.
 ## 10. Notification adapters
 
 `Notifier.notify(incident, *, idempotency_key=...)` is an extension point.
+Notifiers that implement `EventNotifier.notify_event(event)` receive the full
+outbox event instead (including its stable `event_key`). The built-in
+`WebhookNotifier` posts signed JSON using only the standard library.
 Core does not depend on Slack/Teams SDKs.
 
-## 11. State persistence
+## 11. Runtime persistence
 
-`StateStore` remembers what metric-runtime already observed/concluded.
+A `RuntimeStore` (formerly `StateStore`, still available as an alias) remembers
+what metric-runtime already observed and concluded: observations, metric
+state, committed evaluations, evaluation claims, incidents and the
+notification outbox.
 
-`InMemoryStateStore` ships for zero-infra use. Production would typically use
-a persistent store (e.g. Postgres) — not shipped in v0.1.
+- `InMemoryRuntimeStore` (alias `InMemoryStateStore`) — zero-infra, per process.
+- `PostgresRuntimeStore` — durable, multi-worker safe; tables live in a
+  dedicated schema created by numbered migrations
+  (`metric-runtime store migrate`). Install with
+  `pip install "metric-runtime[postgres]"`.
 
 Warehouse/lake = historical business facts.
-StateStore = operational conclusions.
+RuntimeStore = operational conclusions. It is never the analytical source.
+
+## Orchestration layering
+
+```
+CLI: metric-runtime run --once / run
+        │
+        ▼
+MetricRuntime   (what is due, per-tick sessions, outbox drain, run loop)
+        │
+        ▼
+KPIEngine.process   (one evaluation, authoritative lifecycle)
+        │
+        ▼
+RuntimeStore / MetricExecutor / Notifier
+```
+
+`KPIEngine` has no scheduling loop. `MetricRuntime` decides which windows are
+due from each metric's **evaluation cursor** — the `effective_at` of its
+latest committed evaluation — and calls `process()` per window.
+
+## NO_DATA vs execution errors
+
+- A window whose calculation yields **NO_DATA** (no rows, NULL, divide by
+  zero, or no usable baseline) is a valid outcome. It is committed as an
+  observation + evaluation, the metric state is carried forward unchanged
+  (no incidents, no outbox), and the cursor advances so it is never re-run.
+  NO_DATA observations are ignored by state streaks: a data gap neither
+  breaks nor extends a detection/healthy streak, and an OPEN incident stays
+  OPEN across it.
+- An **execution error** (SQL error, connectivity, `ERROR` result) commits
+  nothing. The window stays due and is retried until it falls outside
+  `runtime.max_catchup_windows`.
 
 ## Evaluation identity
 
@@ -207,11 +251,28 @@ Only one worker may own an `EvaluationKey` for transition processing
 (`claim_evaluation`). Concurrent callers receive either the committed result
 or `EvaluationInProgressError`.
 
+In Postgres, claims are leased rows (`expires_at`, from `claim_ttl`), so a
+crashed worker's claim can be taken over. Waiting for earlier windows of a
+stream holds no lock. The commit itself takes a transaction-scoped advisory
+lock per `(metric, scope)` (`pg_advisory_xact_lock`), re-checks the claim,
+duplicates, staleness and earlier in-flight claims while holding it, and
+guards the metric-state upsert with the expected version. A conflict found
+at commit (`StreamCommitConflict`) makes `process()` re-run the ordered
+section (re-read state, recompute) up to 3 times; the calculated observation
+is reused.
+
 ## Transactional outbox
 
 The state transaction persists notification **intent** only
-(`OutboxEvent` with a stable `event_key`). External delivery runs afterward via
-`deliver_notifications()`.
+(`OutboxEvent` with a stable `event_key`). External delivery runs afterward
+(`MetricRuntime.run_once()` drains the outbox every cycle;
+`KPIEngine.deliver_notifications()` is the same logic for library use).
+
+Delivery is leased: a worker claims due events (`claim_token`,
+`claimed_until`), sends them, then marks them delivered or records a failed
+attempt with exponential backoff. After `max_attempts` an event is
+dead-lettered. Writes from a worker whose lease expired are rejected, and an
+expired lease makes the event claimable again.
 
 ## Delivery guarantees
 
@@ -225,7 +286,8 @@ The state transaction persists notification **intent** only
 
 Ineligible (quality-failed) windows are visible to state evolution. They
 **break** consecutive detection streaks; they do not bridge anomalies across a
-gap.
+gap. NO_DATA windows are different: they are skipped by streak evaluation (see
+above).
 
 ## Timezone policy
 
@@ -239,10 +301,11 @@ flowchart TD
   W --> E[Executor]
   E --> O[Observations]
   O --> D[Detector]
-  D --> S[StateStore]
+  D --> S[RuntimeStore]
   S --> G[Graph investigation]
   G --> I[Incident]
   I --> N[Notifier]
 ```
 
-The worker can be a disposable container job. Persistent state lives outside it.
+The worker can be a disposable container job (`run --once`) or a long-running
+process (`run`). Persistent state lives outside it, in the runtime store.

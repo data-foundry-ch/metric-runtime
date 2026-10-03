@@ -3,18 +3,21 @@
 Warehouse/lake: historical business facts.
 Runtime stores: what metric-runtime currently believes / has already acted upon.
 
-Observation, state, incidents, and notification outbox have different retention
-and concurrency characteristics. Transactional commit makes one EvaluationKey's
-mutations atomic from the runtime's perspective.
+Observation, state, incidents, evaluations and notification outbox have
+different retention and concurrency characteristics. Transactional commit makes
+one EvaluationKey's mutations atomic from the runtime's perspective.
 
 Per-(metric, scope) streams additionally enforce monotonic ``effective_at``
 ordering so a newer window cannot be overwritten by an older one.
+
+A ``RuntimeStore`` is never the analytical source: it only holds runtime
+conclusions (observations, state, evaluations, incidents, outbox).
 """
 
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
@@ -34,6 +37,7 @@ __all__ = [
     "MetricStateStore",
     "NotificationOutbox",
     "ObservationStore",
+    "RuntimeStore",
     "RuntimeTransaction",
     "StateStore",
     "TransactionalRuntimeStore",
@@ -101,11 +105,33 @@ class IncidentStore(Protocol):
 
 @runtime_checkable
 class NotificationOutbox(Protocol):
+    """Durable notification intent with leased, retryable delivery.
+
+    ``claim_pending_notifications`` persists a lease (``claim_token`` /
+    ``claimed_until``) on each returned event. Writes that pass a
+    ``claim_token`` only apply while that lease is still held; otherwise they
+    raise :class:`~metric_runtime.exceptions.NotificationLeaseLostError`.
+    """
+
     def enqueue_notification(self, event: OutboxEvent) -> OutboxEvent: ...
 
     def list_pending_notifications(self) -> list[OutboxEvent]: ...
 
-    def mark_notification_delivered(self, event_id: str, *, at: datetime) -> OutboxEvent: ...
+    def claim_pending_notifications(
+        self,
+        *,
+        now: datetime,
+        limit: int | None = None,
+        lease: timedelta,
+    ) -> list[OutboxEvent]: ...
+
+    def mark_notification_delivered(
+        self,
+        event_id: str,
+        *,
+        at: datetime,
+        claim_token: str | None = None,
+    ) -> OutboxEvent: ...
 
     def record_notification_attempt(
         self,
@@ -113,7 +139,14 @@ class NotificationOutbox(Protocol):
         *,
         at: datetime,
         error: str | None = None,
+        claim_token: str | None = None,
+        next_attempt_at: datetime | None = None,
+        dead_letter: bool = False,
     ) -> OutboxEvent: ...
+
+    def release_notification_claim(self, event_id: str, *, claim_token: str) -> None: ...
+
+    def next_notification_due_at(self, now: datetime) -> datetime | None: ...
 
 
 @runtime_checkable
@@ -149,13 +182,35 @@ class RuntimeTransaction(Protocol):
 
 @runtime_checkable
 class TransactionalRuntimeStore(Protocol):
-    def transaction(self) -> AbstractContextManager[RuntimeTransaction]: ...
+    def transaction(
+        self,
+        *,
+        evaluation_key: EvaluationKey | None = None,
+        claim_token: str | None = None,
+    ) -> AbstractContextManager[RuntimeTransaction]:
+        """Open a staged transaction.
+
+        When ``evaluation_key`` / ``claim_token`` are passed, ``commit()``
+        verifies the claim is still held and the stream is still committable.
+        """
+        ...
 
     def claim_evaluation(self, key: EvaluationKey) -> EvaluationClaim: ...
 
     def release_evaluation_claim(self, key: EvaluationKey, *, token: str | None = None) -> None: ...
 
     def get_committed_result(self, key: EvaluationKey) -> EvaluationRecord | None: ...
+
+    def latest_committed_evaluation(
+        self,
+        metric: str,
+        scope_key: str | None = None,
+    ) -> EvaluationRecord | None:
+        """Committed evaluation with the highest ``effective_at`` (scheduler cursor).
+
+        ``scope_key=None`` means the unscoped stream (``canonical_scope_key({})``).
+        """
+        ...
 
     def ordered_stream_commit(
         self,
@@ -168,7 +223,7 @@ class TransactionalRuntimeStore(Protocol):
 
 
 @runtime_checkable
-class StateStore(
+class RuntimeStore(
     ObservationStore,
     MetricStateStore,
     IncidentStore,
@@ -176,6 +231,14 @@ class StateStore(
     TransactionalRuntimeStore,
     Protocol,
 ):
-    """Composed runtime store (back-compat name for the full surface)."""
+    """Durable home for Metric Runtime conclusions.
 
-    ...
+    Stores observations, metric state, committed evaluations, incidents and
+    the notification outbox. Never the analytical source.
+    """
+
+    def close(self) -> None: ...
+
+
+# Back-compat name: the store holds more than state, prefer ``RuntimeStore``.
+StateStore = RuntimeStore
