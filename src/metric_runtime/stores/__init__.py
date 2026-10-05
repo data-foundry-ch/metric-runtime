@@ -3,6 +3,7 @@
 from metric_runtime.identity import EvaluationKey, canonical_scope_json, canonical_scope_key
 from metric_runtime.stores.base import (
     IncidentStore,
+    ManagedRuntimeStore,
     MetricStateStore,
     NotificationOutbox,
     ObservationStore,
@@ -16,6 +17,7 @@ __all__ = [
     "IncidentStore",
     "InMemoryRuntimeStore",
     "InMemoryStateStore",
+    "ManagedRuntimeStore",
     "MetricStateStore",
     "NotificationOutbox",
     "ObservationStore",

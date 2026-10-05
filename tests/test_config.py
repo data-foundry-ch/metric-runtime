@@ -237,6 +237,37 @@ def test_postgres_connection_config():
         PostgresConnectionConfig.model_validate({"dsn": "x", "schema": "bad-name;drop"})
 
 
+def test_postgres_source_and_runtime_schemas():
+    from metric_runtime.config.models import PostgresConnectionConfig
+
+    cfg = PostgresConnectionConfig.model_validate(
+        {"dsn": "postgresql://h/db", "source_schema": "analytics", "fact_table": "facts"}
+    )
+    assert cfg.runtime_schema == cfg.schema_name == "metric_runtime"
+    assert cfg.effective_fact_table == "analytics.facts"
+    assert cfg.effective_source_schema == "analytics"
+    qualified = cfg.model_copy(update={"fact_table": "marts.orders"})
+    assert qualified.effective_fact_table == "marts.orders"
+    assert qualified.effective_source_schema == "marts"
+    bare = PostgresConnectionConfig.model_validate({"dsn": "x"})
+    assert bare.effective_source_schema == "public" and bare.effective_fact_table is None
+
+    legacy = PostgresConnectionConfig.model_validate({"dsn": "x", "schema": "mr"})
+    same = PostgresConnectionConfig.model_validate(
+        {"dsn": "x", "schema": "mr", "runtime_schema": "mr"}
+    )
+    assert legacy.runtime_schema == same.runtime_schema == "mr"
+    with pytest.raises(ValidationError, match="runtime_schema only"):
+        PostgresConnectionConfig.model_validate({"dsn": "x", "schema": "a", "runtime_schema": "b"})
+    with pytest.raises(ValidationError, match="source_schema"):
+        PostgresConnectionConfig.model_validate({"dsn": "x", "source_schema": "a b"})
+
+    dumped = cfg.model_dump(mode="json")
+    assert dumped["dsn"] == "**********"  # SecretStr never serializes its value
+    round_trip = PostgresConnectionConfig.model_validate({**dumped, "dsn": "postgresql://h/db"})
+    assert round_trip == cfg
+
+
 def test_build_runtime_store_roles(tmp_path: Path):
     from metric_runtime.config.factory import build_runtime_store, validate_profile_wiring
 

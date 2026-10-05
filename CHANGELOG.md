@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0] - Unreleased
 
+### Added — adapter-first architecture
+
+- ``metric_runtime.adapters``: ``MetricRuntimeAdapter`` protocol, ``BaseAdapter``,
+  ``AdapterCapabilities`` (``metric_source`` / ``runtime_store`` / ``notifier`` / ``durable`` /
+  ``distributed_claims`` / ``migrations``), ``AdapterContext`` and a registry
+  (``register_adapter``, ``get_adapter``, ``registered_adapters``) keyed by connection ``type``
+- External adapters register via the ``metric_runtime.adapters`` entry-point group, discovered
+  on first use of an unknown type; built-in adapters are imported lazily, so
+  ``import metric_runtime`` loads no database driver
+- Built-in adapters: ``postgres`` (reference: source + durable store), ``duckdb`` (source only),
+  ``memory`` (store only), ``webhook`` (notifier only)
+- One connection may serve both ``metric_source`` and ``runtime_store``; each role builds its own
+  client resources (e.g. read-only executor session vs writable store pool)
+- Adapter-owned role boundary (``role_conflicts`` on the runtime store's adapter); Postgres
+  rejects a ``runtime_schema`` equal to the effective source schema on the same database
+- Postgres connections: ``source_schema`` (search path of the read-only session; qualifies an
+  unqualified ``fact_table``) and ``runtime_schema``
+- ``ManagedRuntimeStore`` runtime-checkable protocol (``namespace``, ``schema_status()``,
+  ``migrate()``, ``ensure_ready()``); ``metric_runtime.migrations`` with the platform-neutral
+  ``Migration`` / ``SchemaStatus`` / checksum verification
+- ``UnsupportedRoleError``; ``config show`` also redacts every ``SecretStr`` field an adapter's
+  config model declares
+- ``docs/adapters.md``
+
+### Changed — adapter-first architecture
+
+- Platform code moved into ``metric_runtime/adapters/<platform>/`` (Postgres executor, store,
+  migrations and SQL files; DuckDB executor; webhook notifier; connection config models). Old
+  import paths (``metric_runtime.execution.{DuckDBExecutor,PostgresExecutor}``,
+  ``metric_runtime.stores.postgres``, ``metric_runtime.stores.migrations``,
+  ``metric_runtime.notifications.WebhookNotifier``, ``metric_runtime.config.models.*ConnectionConfig``)
+  remain as re-exports
+- Profile validation, the factory and the CLI resolve every role through adapter capabilities;
+  no platform branching remains in ``config/factory.py`` or ``cli.py``
+- ``RuntimeStore`` documentation states guarantees (unique claims, idempotent atomic commits,
+  ordered state, leased outbox, recovery) instead of Postgres mechanisms
+- Postgres ``schema:`` is a deprecated alias for ``runtime_schema:``
+- ``store migrate`` / ``store status`` print the store's namespace (e.g. ``schema metric_runtime``)
+- Core no longer assumes DuckDB SQL: ``EvaluationSession`` defers to the executor's
+  ``sql_dialects``, and ``SqlBatchSource(dialect=...)`` defaults to ``None`` like
+  ``SqlCalculation`` (pass ``dialect="duckdb"`` explicitly to pin it)
+
 ### Added — durable runtime
 
 - ``RuntimeStore`` protocol (``StateStore`` kept as alias) with an evaluation cursor

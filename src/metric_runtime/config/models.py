@@ -6,8 +6,7 @@ Connections live with the environment.
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, PrivateAttr, SecretStr, field_validator, model_validator
 
@@ -143,205 +142,24 @@ class MetricRuntimeProjectConfig(BaseModel):
     state: StatePolicyConfig = Field(default_factory=StatePolicyConfig)
 
 
-class DuckDBConnectionConfig(BaseModel):
-    type: Literal["duckdb"] = "duckdb"
-    path: Path | str | None = None
-    fact_table: str | None = None
-    read_only: bool = True
+# Connection models are adapter-defined (``adapter.config_model``); these
+# names stay importable from here for backwards compatibility.
+_ADAPTER_CONFIG_MODELS = {
+    "DuckDBConnectionConfig": "metric_runtime.adapters.duckdb.config",
+    "MemoryStateStoreConfig": "metric_runtime.adapters.memory.adapter",
+    "PostgresConnectionConfig": "metric_runtime.adapters.postgres.config",
+    "WebhookConnectionConfig": "metric_runtime.adapters.webhook.config",
+}
+
+AnyConnectionConfig = BaseModel
 
 
-class MemoryStateStoreConfig(BaseModel):
-    type: Literal["memory"] = "memory"
+def __getattr__(name: str) -> Any:
+    if name in _ADAPTER_CONFIG_MODELS:
+        import importlib
 
-
-def _parse_conninfo(dsn: str) -> dict[str, Any] | None:
-    """Parse a libpq DSN (URL or ``key=value``) without connecting."""
-    if not dsn:
-        return {}
-    try:
-        from psycopg.conninfo import conninfo_to_dict
-    except ImportError:
-        pass
-    else:
-        try:
-            return dict(conninfo_to_dict(dsn))
-        except Exception:  # noqa: BLE001
-            return None
-    from urllib.parse import unquote, urlsplit
-
-    if "://" not in dsn:
-        try:
-            return dict(part.split("=", 1) for part in dsn.split())
-        except ValueError:
-            return None
-    parts = urlsplit(dsn)
-    return {
-        "host": parts.hostname,
-        "port": parts.port,
-        "dbname": unquote(parts.path.lstrip("/")) or None,
-        "user": parts.username,
-    }
-
-
-class PostgresConnectionConfig(BaseModel):
-    """Postgres connection — ``runtime_store`` and/or read-only ``metric_source`` role.
-
-    Give either ``dsn`` or ``host`` + ``database``. Discrete fields override
-    the same keys in ``dsn``.
-
-    Runtime-store role: tables live in ``schema`` (default ``metric_runtime``).
-    Source role: ``fact_table`` (optionally ``schema.table``) for formula
-    metrics, ``timestamp_column``, ``statement_timeout``. When both roles
-    resolve to the same database, the runtime schema must differ from the
-    source schema.
-    """
-
-    type: Literal["postgres"] = "postgres"
-    dsn: SecretStr | None = None
-    host: str | None = None
-    port: int | None = None
-    database: str | None = None
-    user: str | None = None
-    password: SecretStr | None = None
-    sslmode: str | None = None
-    connect_timeout: int | None = Field(default=10, ge=1)
-    schema_name: str = Field(default="metric_runtime", alias="schema")
-    claim_ttl: str = "15m"
-    pool_min_size: int = Field(default=1, ge=0)
-    pool_max_size: int = Field(default=10, ge=1)
-    # Source role.
-    fact_table: str | None = None
-    timestamp_column: str = "ts"
-    statement_timeout: str = "30s"
-
-    model_config = {"populate_by_name": True}
-
-    @field_validator("claim_ttl")
-    @classmethod
-    def _validate_claim_ttl(cls, value: str) -> str:
-        return _positive_duration(value, field="postgres.claim_ttl")
-
-    @field_validator("statement_timeout")
-    @classmethod
-    def _validate_statement_timeout(cls, value: str) -> str:
-        return _positive_duration(value, field="postgres.statement_timeout")
-
-    @property
-    def source_schema(self) -> str:
-        """Schema of ``fact_table`` (``public`` when unqualified or unset)."""
-        if self.fact_table and "." in self.fact_table:
-            return self.fact_table.rsplit(".", 1)[0]
-        return "public"
-
-    def database_identity(self) -> tuple[str, int, str] | None:
-        """``(host, port, dbname)`` used to detect two roles on one database.
-
-        ``None`` when it cannot be determined offline (e.g. unparseable dsn).
-        """
-        params: dict[str, Any] = {}
-        if self.dsn is not None:
-            parsed = _parse_conninfo(self.dsn.get_secret_value())
-            if parsed is None:
-                return None
-            params = parsed
-        params.update(self.connect_kwargs())
-        host = str(params.get("host") or "localhost").lower()
-        try:
-            port = int(params.get("port") or 5432)
-        except (TypeError, ValueError):
-            return None
-        dbname = params.get("dbname") or params.get("user")
-        if not dbname:
-            return None
-        return host, port, str(dbname)
-
-    @field_validator("schema_name")
-    @classmethod
-    def _validate_schema(cls, value: str) -> str:
-        from metric_runtime.exceptions import ConfigurationError
-        from metric_runtime.stores.migrations import validate_schema_name
-
-        try:
-            return validate_schema_name(value)
-        except ConfigurationError as exc:
-            raise ValueError(str(exc)) from exc
-
-    @model_validator(mode="after")
-    def _require_target(self) -> PostgresConnectionConfig:
-        if self.dsn is None and not (self.host and self.database):
-            raise ValueError("postgres connection requires 'dsn' or 'host' + 'database'")
-        return self
-
-    def conninfo(self) -> str:
-        return self.dsn.get_secret_value() if self.dsn is not None else ""
-
-    def connect_kwargs(self) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {
-            "host": self.host,
-            "port": self.port,
-            "dbname": self.database,
-            "user": self.user,
-            "password": self.password.get_secret_value() if self.password else None,
-            "sslmode": self.sslmode,
-            "connect_timeout": self.connect_timeout,
-        }
-        return {k: v for k, v in kwargs.items() if v is not None}
-
-
-class WebhookConnectionConfig(BaseModel):
-    """HTTP(S) JSON webhook for outbox delivery (``notifier`` role)."""
-
-    type: Literal["webhook"] = "webhook"
-    url: SecretStr
-    secret: SecretStr | None = None
-    headers: dict[str, SecretStr] = Field(default_factory=dict)
-    timeout: float = Field(default=10.0, gt=0)
-
-    @field_validator("url")
-    @classmethod
-    def _validate_url(cls, value: SecretStr) -> SecretStr:
-        from urllib.parse import urlsplit
-
-        parts = urlsplit(value.get_secret_value())
-        if parts.scheme not in {"http", "https"} or not parts.netloc:
-            raise ValueError("webhook url must be an absolute http(s) URL")
-        return value
-
-
-_FUTURE_CONNECTION_TYPES = {"snowflake", "bigquery", "databricks"}
-
-
-# Documented for future adapters — not implemented yet.
-class UnsupportedConnectionConfig(BaseModel):
-    type: str
-    model_config = {"extra": "allow"}
-
-    @field_validator("type")
-    @classmethod
-    def _reject_known_unsupported(cls, value: str) -> str:
-        if value in _FUTURE_CONNECTION_TYPES:
-            raise ValueError(
-                f"Connection type {value!r} is documented as a future adapter "
-                "and is not implemented in this metric-runtime release"
-            )
-        raise ValueError(f"Unknown connection type: {value!r}")
-
-
-ConnectionConfig = Annotated[
-    DuckDBConnectionConfig
-    | MemoryStateStoreConfig
-    | PostgresConnectionConfig
-    | WebhookConnectionConfig
-    | UnsupportedConnectionConfig,
-    Field(discriminator="type"),
-]
-
-AnyConnectionConfig = (
-    DuckDBConnectionConfig
-    | MemoryStateStoreConfig
-    | PostgresConnectionConfig
-    | WebhookConnectionConfig
-)
+        return getattr(importlib.import_module(_ADAPTER_CONFIG_MODELS[name]), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class InlineMemoryStateStore(BaseModel):
@@ -394,37 +212,24 @@ class ConnectionsFile(BaseModel):
     # Connections whose ${ENV} placeholders could not be resolved at load time.
     _unresolved: dict[str, Exception] = PrivateAttr(default_factory=dict)
 
-    def get_connection(self, name: str) -> AnyConnectionConfig:
-        from metric_runtime.exceptions import (
-            ConfigurationError,
-            UnknownConnectionError,
-            UnsupportedConnectionTypeError,
-        )
+    def connection_type(self, name: str) -> Any:
+        """Declared ``type`` of a connection (no validation, no env resolution)."""
+        from metric_runtime.exceptions import UnknownConnectionError
 
         if name not in self.connections:
             raise UnknownConnectionError(f"Unknown connection: {name!r}")
+        return self.connections[name].get("type")
+
+    def get_connection(self, name: str) -> AnyConnectionConfig:
+        """Validate a connection with its adapter's ``config_model``."""
+        from metric_runtime.adapters.registry import get_adapter
+        from metric_runtime.exceptions import ConfigurationError
+
+        adapter = get_adapter(self.connection_type(name))
         if name in self._unresolved:
             raise self._unresolved[name]
-        raw = dict(self.connections[name])
-        ctype = raw.get("type")
-        model: type[BaseModel]
-        if ctype == "duckdb":
-            model = DuckDBConnectionConfig
-        elif ctype == "memory":
-            model = MemoryStateStoreConfig
-        elif ctype == "postgres":
-            model = PostgresConnectionConfig
-        elif ctype == "webhook":
-            model = WebhookConnectionConfig
-        elif ctype in _FUTURE_CONNECTION_TYPES:
-            raise UnsupportedConnectionTypeError(
-                f"Connection type {ctype!r} is documented as a future adapter "
-                "and is not implemented in this metric-runtime release"
-            )
-        else:
-            raise UnsupportedConnectionTypeError(f"Unknown connection type: {ctype!r}")
         try:
-            return model.model_validate(raw)
+            return adapter.config_model.model_validate(dict(self.connections[name]))
         except ValueError as exc:
             raise ConfigurationError(f"Invalid connection {name!r}: {exc}") from exc
 

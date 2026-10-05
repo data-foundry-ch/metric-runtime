@@ -216,12 +216,7 @@ def test_sql_batch_source_on_postgres(executor, analytics):
     assert engine.metric_value("rtm", TICK) == 50.0
 
 
-def test_run_once_with_both_roles_on_one_server(
-    tmp_path: Path, monkeypatch, capsys, pg_dsn, pg_schema, analytics
-):
-    """End-to-end: Postgres source + Postgres runtime store, separate schemas."""
-    from metric_runtime.cli import main
-
+def _project(tmp_path: Path, monkeypatch, facts_relation: str) -> Path:
     module = f"pgcat_{uuid.uuid4().hex[:8]}"
     (tmp_path / f"{module}.py").write_text(
         "from metric_runtime import Metric, MetricCatalog, SqlCalculation\n"
@@ -230,7 +225,7 @@ def test_run_once_with_both_roles_on_one_server(
         "    Metric(id='revenue', name='Revenue', formula=Formula.sum('revenue')),\n"
         "    Metric(id='orders_sql', name='Orders', calculation=SqlCalculation(\n"
         "        dialect='postgres',\n"
-        f"        query='SELECT SUM(orders)::float AS value FROM {analytics}.facts "
+        f"        query='SELECT SUM(orders)::float AS value FROM {facts_relation} "
         "WHERE ts = :effective_at')),\n"
         "])\n",
         encoding="utf-8",
@@ -242,17 +237,11 @@ def test_run_once_with_both_roles_on_one_server(
         "runtime:\n  default_profile: production\n  evaluation_interval: 15m\n",
         encoding="utf-8",
     )
-    conns = tmp_path / "connections.yaml"
-    conns.write_text(
-        "connections:\n"
-        f"  warehouse:\n    type: postgres\n    dsn: {pg_dsn}\n"
-        f"    fact_table: {analytics}.facts\n    statement_timeout: 10s\n"
-        f"  runtime_db:\n    type: postgres\n    dsn: {pg_dsn}\n    schema: {pg_schema}\n"
-        "profiles:\n  production:\n    metric_source: warehouse\n    runtime_store: runtime_db\n"
-        "    notifier:\n      type: none\n",
-        encoding="utf-8",
-    )
-    base = ["--project-config", str(project), "--connections", str(conns), "--log-level", "ERROR"]
+    return project
+
+
+def _run_twice_and_check(capsys, base: list[str], pg_dsn: str, analytics: str, runtime: str):
+    from metric_runtime.cli import main
 
     assert main(["validate", *base]) == 0
     capsys.readouterr()
@@ -271,23 +260,102 @@ def test_run_once_with_both_roles_on_one_server(
     import psycopg
 
     with psycopg.connect(pg_dsn) as conn:
-        runtime_tables = conn.execute(
+        source_tables = conn.execute(
             "SELECT count(*) FROM information_schema.tables WHERE table_schema = %s",
             (analytics,),
         ).fetchone()[0]
-        evaluations = conn.execute(f'SELECT count(*) FROM "{pg_schema}".evaluations').fetchone()[0]
-    assert runtime_tables == 1  # only the seeded facts table lives in the source schema
+        evaluations = conn.execute(f'SELECT count(*) FROM "{runtime}".evaluations').fetchone()[0]
+    assert source_tables == 1  # only the seeded facts table lives in the source schema
     assert evaluations == 2
 
 
-def test_same_schema_for_both_roles_is_rejected(tmp_path: Path, capsys, pg_dsn):
+def test_run_once_with_one_connection_for_both_roles(
+    tmp_path: Path, monkeypatch, capsys, pg_dsn, pg_schema, analytics
+):
+    """The common case: one warehouse connection, source and runtime schemas."""
+    project = _project(tmp_path, monkeypatch, "facts")  # resolved via source_schema
+    conns = tmp_path / "connections.yaml"
+    conns.write_text(
+        "connections:\n"
+        f"  warehouse:\n    type: postgres\n    dsn: {pg_dsn}\n"
+        f"    source_schema: {analytics}\n    runtime_schema: {pg_schema}\n"
+        "    fact_table: facts\n"
+        "profiles:\n  production:\n    metric_source: warehouse\n    runtime_store: warehouse\n"
+        "    notifier:\n      type: none\n",
+        encoding="utf-8",
+    )
+    base = ["--project-config", str(project), "--connections", str(conns), "--log-level", "ERROR"]
+    _run_twice_and_check(capsys, base, pg_dsn, analytics, pg_schema)
+
+
+def test_run_once_with_separate_connections_on_one_server(
+    tmp_path: Path, monkeypatch, capsys, pg_dsn, pg_schema, analytics
+):
+    project = _project(tmp_path, monkeypatch, f"{analytics}.facts")
+    conns = tmp_path / "connections.yaml"
+    conns.write_text(
+        "connections:\n"
+        f"  warehouse:\n    type: postgres\n    dsn: {pg_dsn}\n"
+        f"    fact_table: {analytics}.facts\n    statement_timeout: 10s\n"
+        f"  runtime_db:\n    type: postgres\n    dsn: {pg_dsn}\n    schema: {pg_schema}\n"
+        "profiles:\n  production:\n    metric_source: warehouse\n    runtime_store: runtime_db\n"
+        "    notifier:\n      type: none\n",
+        encoding="utf-8",
+    )
+    base = ["--project-config", str(project), "--connections", str(conns), "--log-level", "ERROR"]
+    _run_twice_and_check(capsys, base, pg_dsn, analytics, pg_schema)
+
+
+def test_one_connection_builds_separate_role_clients(tmp_path: Path, pg_dsn, pg_schema, analytics):
+    from metric_runtime.config.factory import build_runtime
+
+    conns = tmp_path / "connections.yaml"
+    conns.write_text(
+        "connections:\n"
+        f"  warehouse:\n    type: postgres\n    dsn: {pg_dsn}\n"
+        f"    source_schema: {analytics}\n    runtime_schema: {pg_schema}\n"
+        "    fact_table: facts\n"
+        "profiles:\n  production:\n    metric_source: warehouse\n    runtime_store: warehouse\n",
+        encoding="utf-8",
+    )
+    project = tmp_path / "metric-runtime.yaml"
+    project.write_text("runtime:\n  default_profile: production\n", encoding="utf-8")
+    engine = build_runtime(None, project_config=project, connections_config=conns, catalog=[])
+    executor, store = engine.executor, engine.runtime_store
+    try:
+        store.migrate()
+        assert executor.ping()
+        with executor._read_only() as source_conn, store._connection() as store_conn:
+            assert source_conn is not store_conn
+            assert source_conn.execute("SHOW transaction_read_only").fetchone()[0] == "on"
+            assert store_conn.execute("SHOW transaction_read_only").fetchone()[0] == "off"
+            assert source_conn.execute("SHOW search_path").fetchone()[0] == analytics
+        assert executor.row_count_at(TICK) == 2
+    finally:
+        executor.close()
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "source_fields, runtime_schema",
+    [
+        ("    fact_table: analytics.facts\n", "analytics"),
+        ("    source_schema: analytics\n    fact_table: facts\n", "analytics"),
+        # A qualified fact_table wins over source_schema.
+        ("    source_schema: public\n    fact_table: metric_runtime.orders\n", "metric_runtime"),
+    ],
+)
+def test_same_schema_for_both_roles_is_rejected(
+    tmp_path: Path, capsys, pg_dsn, source_fields, runtime_schema
+):
     from metric_runtime.cli import main
 
     conns = tmp_path / "connections.yaml"
     conns.write_text(
         "connections:\n"
-        f"  warehouse:\n    type: postgres\n    dsn: {pg_dsn}\n    fact_table: analytics.facts\n"
-        f"  runtime_db:\n    type: postgres\n    dsn: {pg_dsn}\n    schema: analytics\n"
+        f"  warehouse:\n    type: postgres\n    dsn: {pg_dsn}\n{source_fields}"
+        f"  runtime_db:\n    type: postgres\n    dsn: {pg_dsn}\n"
+        f"    runtime_schema: {runtime_schema}\n"
         "profiles:\n  production:\n    metric_source: warehouse\n    runtime_store: runtime_db\n",
         encoding="utf-8",
     )
@@ -295,5 +363,5 @@ def test_same_schema_for_both_roles_is_rejected(tmp_path: Path, capsys, pg_dsn):
     project.write_text("runtime:\n  default_profile: production\n", encoding="utf-8")
     base = ["--project-config", str(project), "--connections", str(conns)]
     assert main(["validate", *base]) == 1
-    assert "same database and schema 'analytics'" in capsys.readouterr().err
+    assert f"effective source schema {runtime_schema!r}" in capsys.readouterr().err
     assert main(["run", "--once", *base]) == 1

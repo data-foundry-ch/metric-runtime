@@ -3,30 +3,31 @@
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pydantic import BaseModel
+
+from metric_runtime.adapters.base import AdapterContext, MetricRuntimeAdapter, Role
+from metric_runtime.adapters.registry import adapters_supporting, get_adapter
 from metric_runtime.catalog import KPICatalog, MetricCatalog
 from metric_runtime.config.duration import parse_duration, parse_duration_minutes
 from metric_runtime.config.loader import (
     load_connections_config,
     load_project_config,
-    redact_secrets,
+    redact_connections,
 )
 from metric_runtime.config.models import (
     ConnectionsFile,
-    DuckDBConnectionConfig,
     InlineMemoryStateStore,
     InlineNotifier,
-    MemoryStateStoreConfig,
     MetricRuntimeProjectConfig,
-    PostgresConnectionConfig,
     ProfileConfig,
-    WebhookConnectionConfig,
 )
 from metric_runtime.engine import KPIEngine
-from metric_runtime.exceptions import ConfigurationError, MetricRuntimeError
+from metric_runtime.exceptions import ConfigurationError, MetricRuntimeError, UnsupportedRoleError
+from metric_runtime.execution.base import MetricExecutor
 from metric_runtime.models import KPI, Metric
 from metric_runtime.notifications.base import LoggingNotifier, Notifier, NullNotifier
 from metric_runtime.notifications.delivery import NotificationPolicy
@@ -138,78 +139,79 @@ def resolve_profile(
     return connections.profiles[name]
 
 
-def build_executor_from_connection(
-    conn: DuckDBConnectionConfig | PostgresConnectionConfig,
-    project: MetricRuntimeProjectConfig,
-    *,
-    base_dir: Path | None = None,
-):
-    fact_table = conn.fact_table or project.runtime.fact_table
-    if isinstance(conn, PostgresConnectionConfig):
-        from metric_runtime.execution.postgres import PostgresExecutor
-
-        timeout = parse_duration(conn.statement_timeout, field="statement_timeout")
-        try:
-            return PostgresExecutor(
-                conn.conninfo(),
-                fact_table=fact_table,
-                timestamp_column=conn.timestamp_column,
-                statement_timeout_ms=int(timeout.total_seconds() * 1000),
-                connect_kwargs=conn.connect_kwargs(),
-            )
-        except ValueError as exc:
-            raise ConfigurationError(f"Invalid postgres metric_source: {exc}") from exc
-
-    from metric_runtime.execution.duckdb import DuckDBExecutor
-
-    if conn.path is None:
-        raise ConfigurationError("DuckDB connection requires path")
-    path = Path(conn.path)
-    if not path.is_absolute() and base_dir is not None:
-        path = (base_dir / path).resolve()
-    return DuckDBExecutor(
-        path,
-        fact_table=fact_table,
-        read_only=conn.read_only,
+def _context(
+    project: MetricRuntimeProjectConfig | None,
+    base_dir: Path | None,
+    connection_name: str | None = None,
+) -> AdapterContext:
+    return AdapterContext(
+        project=project or MetricRuntimeProjectConfig(),
+        base_dir=base_dir or Path.cwd(),
+        connection_name=connection_name,
     )
 
 
-def build_runtime_store(profile: ProfileConfig, connections) -> RuntimeStore:
-    """Build the profile's runtime store (in-memory or Postgres).
+def _adapter_for_role(connections: ConnectionsFile, name: str, role: Role) -> MetricRuntimeAdapter:
+    """Resolve a connection's adapter and require that it supports ``role``."""
+    ctype = connections.connection_type(name)
+    adapter = get_adapter(ctype)
+    if not adapter.capabilities.supports(role):
+        raise UnsupportedRoleError(_unsupported_role_message(role, name, ctype, adapter))
+    return adapter
 
-    The Postgres store is returned unmigrated; callers that run evaluations
-    should call ``ensure_migrated()`` (``metric-runtime store migrate`` applies).
+
+def _unsupported_role_message(
+    role: str, name: str, ctype: Any, adapter: MetricRuntimeAdapter
+) -> str:
+    hint_fn = getattr(adapter, "unsupported_role_hint", None)
+    hint = hint_fn(role) if callable(hint_fn) else None
+    reason = hint or f"the {ctype!r} adapter does not support the {role} role"
+    supporting = ", ".join(adapters_supporting(role)) or "none registered"
+    return (
+        f"{role} {name!r} has type {ctype!r}: {reason} (adapters supporting {role}: {supporting})"
+    )
+
+
+def build_executor_from_connection(
+    conn: BaseModel,
+    project: MetricRuntimeProjectConfig,
+    *,
+    base_dir: Path | None = None,
+    connection_name: str | None = None,
+) -> MetricExecutor:
+    """Build a ``metric_source`` executor from a validated connection config."""
+    ctype = getattr(conn, "type", None)
+    adapter = get_adapter(ctype)
+    if not adapter.capabilities.supports("metric_source"):
+        raise UnsupportedRoleError(
+            _unsupported_role_message("metric_source", connection_name or "?", ctype, adapter)
+        )
+    return adapter.build_executor(conn, _context(project, base_dir, connection_name))
+
+
+def build_runtime_store(
+    profile: ProfileConfig,
+    connections: ConnectionsFile,
+    *,
+    context: AdapterContext | None = None,
+) -> RuntimeStore:
+    """Build the profile's runtime store through its connection's adapter.
+
+    No ``runtime_store`` (or an inline ``{type: memory}``) gives a
+    process-local :class:`InMemoryRuntimeStore`. Stores with a versioned
+    schema are returned unmigrated; ``metric-runtime store migrate`` applies.
     """
     store_ref = profile.runtime_store
     if store_ref is None or isinstance(store_ref, InlineMemoryStateStore):
         return InMemoryRuntimeStore()
+    adapter = _adapter_for_role(connections, store_ref, "runtime_store")
     cfg = connections.get_connection(store_ref)
-    if isinstance(cfg, MemoryStateStoreConfig):
-        return InMemoryRuntimeStore()
-    if isinstance(cfg, PostgresConnectionConfig):
-        from metric_runtime.stores.postgres import PostgresRuntimeStore
-
-        return PostgresRuntimeStore(
-            cfg.conninfo(),
-            schema=cfg.schema_name,
-            min_size=cfg.pool_min_size,
-            max_size=cfg.pool_max_size,
-            claim_ttl=parse_duration(cfg.claim_ttl, field="claim_ttl").total_seconds(),
-            connect_kwargs=cfg.connect_kwargs(),
-        )
-    raise ConfigurationError(
-        f"runtime_store connection {store_ref!r} has type {cfg.type!r}; "
-        "use type: postgres (durable) or type: memory"
-    )
+    ctx = context or _context(None, None)
+    return adapter.build_runtime_store(cfg, replace(ctx, connection_name=store_ref))
 
 
 # Back-compat name.
 build_state_store = build_runtime_store
-
-
-_SOURCE_TYPES = {"duckdb", "postgres"}
-_RUNTIME_STORE_TYPES = {"memory", "postgres"}
-_NOTIFIER_TYPES = {"webhook"}
 
 
 def validate_profile_wiring(
@@ -220,24 +222,26 @@ def validate_profile_wiring(
 ) -> list[str]:
     """Role checks for a profile; never opens a connection.
 
-    With ``check_fields=False`` only the declared connection ``type`` is
-    checked, so unresolved ``${ENV}`` placeholders do not matter (offline
-    ``validate``).
+    Each role is resolved independently: the connection's adapter must
+    support it. When the profile has both a source and a runtime store, the
+    runtime store's adapter decides whether runtime-owned objects could
+    collide with source data. With ``check_fields=False`` connection fields
+    are not required to validate (unresolved ``${ENV}`` placeholders do not
+    matter for offline ``validate``).
     """
     errors: list[str] = []
 
-    def check(role: str, name: str, allowed: set[str]) -> None:
+    def check(role: Role, name: str) -> None:
         if name not in connections.connections:
             errors.append(f"{role}: unknown connection {name!r}")
             return
-        ctype = connections.connections[name].get("type")
-        if ctype not in allowed:
-            hint = (
-                "DuckDB is an analytical source only; use type: postgres or type: memory"
-                if role == "runtime_store" and ctype == "duckdb"
-                else f"expected one of {sorted(allowed)}"
-            )
-            errors.append(f"{role} {name!r} has type {ctype!r}: {hint}")
+        try:
+            _adapter_for_role(connections, name, role)
+        except UnsupportedRoleError as exc:
+            errors.append(str(exc))
+            return
+        except MetricRuntimeError as exc:
+            errors.append(f"{role} {name!r}: {exc}")
             return
         if check_fields:
             try:
@@ -246,61 +250,55 @@ def validate_profile_wiring(
                 errors.append(f"{role}: {exc}")
 
     if profile.metric_source is not None:
-        check("metric_source", profile.metric_source, _SOURCE_TYPES)
+        check("metric_source", profile.metric_source)
     if isinstance(profile.runtime_store, str):
-        check("runtime_store", profile.runtime_store, _RUNTIME_STORE_TYPES)
+        check("runtime_store", profile.runtime_store)
     if isinstance(profile.notifier, str):
-        check("notifier", profile.notifier, _NOTIFIER_TYPES)
+        check("notifier", profile.notifier)
     if not errors:
-        errors.extend(_shared_database_errors(profile, connections))
+        errors.extend(_role_conflicts(profile, connections))
     return errors
 
 
-def _shared_database_errors(profile: ProfileConfig, connections: ConnectionsFile) -> list[str]:
-    """Runtime tables must not share a schema with the analytical source."""
+def _role_conflicts(profile: ProfileConfig, connections: ConnectionsFile) -> list[str]:
+    """Ask the runtime store's adapter whether its objects could collide with the source."""
     source_ref, store_ref = profile.metric_source, profile.runtime_store
     if not isinstance(source_ref, str) or not isinstance(store_ref, str):
         return []
-    raw_source = connections.connections.get(source_ref, {})
-    raw_store = connections.connections.get(store_ref, {})
-    if raw_source.get("type") != "postgres" or raw_store.get("type") != "postgres":
-        return []
     try:
-        source = PostgresConnectionConfig.model_validate(raw_source)
-        store = PostgresConnectionConfig.model_validate(raw_store)
-    except ValueError:
+        store_adapter = get_adapter(connections.connection_type(store_ref))
+        source_cfg = connections.get_connection(source_ref)
+        store_cfg = connections.get_connection(store_ref)
+    except MetricRuntimeError:
         return []  # unresolved placeholders (offline validate); checked at build time
-    same_db = source_ref == store_ref
-    if not same_db:
-        source_id, store_id = source.database_identity(), store.database_identity()
-        same_db = source_id is not None and source_id == store_id
-    if same_db and store.schema_name == source.source_schema:
-        return [
-            f"runtime_store {store_ref!r} and metric_source {source_ref!r} use the same "
-            f"database and schema {store.schema_name!r}; give the runtime store its own "
-            "schema (connection 'schema:') so runtime tables never mix with source data"
-        ]
-    return []
+    conflicts = store_adapter.role_conflicts(
+        source_type=connections.connection_type(source_ref),
+        source_config=source_cfg,
+        runtime_config=store_cfg,
+        same_connection=source_ref == store_ref,
+    )
+    return [
+        f"runtime_store {store_ref!r} / metric_source {source_ref!r}: {message}"
+        for message in conflicts
+    ]
 
 
-def build_notifier(profile: ProfileConfig, connections: ConnectionsFile) -> Notifier:
+def build_notifier(
+    profile: ProfileConfig,
+    connections: ConnectionsFile,
+    *,
+    context: AdapterContext | None = None,
+) -> Notifier:
     """Build the profile's notifier (default: :class:`LoggingNotifier`)."""
     ref = profile.notifier
     if ref is None:
         return LoggingNotifier()
     if isinstance(ref, InlineNotifier):
         return NullNotifier() if ref.type == "none" else LoggingNotifier()
+    adapter = _adapter_for_role(connections, ref, "notifier")
     cfg = connections.get_connection(ref)
-    if not isinstance(cfg, WebhookConnectionConfig):
-        raise ConfigurationError(f"notifier {ref!r} must be a type: webhook connection")
-    from metric_runtime.notifications.webhook import WebhookNotifier
-
-    return WebhookNotifier(
-        cfg.url.get_secret_value(),
-        secret=cfg.secret.get_secret_value() if cfg.secret else None,
-        headers={k: v.get_secret_value() for k, v in cfg.headers.items()},
-        timeout=cfg.timeout,
-    )
+    ctx = context or _context(None, None)
+    return adapter.build_notifier(cfg, replace(ctx, connection_name=ref))
 
 
 @dataclass
@@ -349,18 +347,23 @@ def _build_engine(
         else:
             catalog = MetricCatalog([])
 
+    # Each role gets its own resources, even when it uses the same connection.
+    context = _context(project, resolved.base_dir)
     executor = None
     if profile_cfg.metric_source:
-        conn = connections.get_connection(profile_cfg.metric_source)
-        assert isinstance(conn, (DuckDBConnectionConfig, PostgresConnectionConfig))
-        executor = build_executor_from_connection(conn, project, base_dir=resolved.base_dir)
+        source_ref = profile_cfg.metric_source
+        adapter = _adapter_for_role(connections, source_ref, "metric_source")
+        executor = adapter.build_executor(
+            connections.get_connection(source_ref),
+            replace(context, connection_name=source_ref),
+        )
 
-    runtime_store = build_runtime_store(profile_cfg, connections)
+    runtime_store = build_runtime_store(profile_cfg, connections, context=context)
     return KPIEngine(
         catalog=catalog,
         executor=executor,
         runtime_store=runtime_store,
-        notifier=notifier or build_notifier(profile_cfg, connections),
+        notifier=notifier or build_notifier(profile_cfg, connections, context=context),
         state_policy=state_policy_from_project(project),
         notification_policy=notification_policy_from_project(project),
     )
@@ -418,7 +421,12 @@ def build_profile_runtime_store(
     errors = validate_profile_wiring(store_only, resolved.connections)
     if errors:
         raise ConfigurationError(f"Profile {resolved.profile_name!r}: " + "; ".join(errors))
-    return build_runtime_store(resolved.profile, resolved.connections), resolved.profile_name
+    store = build_runtime_store(
+        resolved.profile,
+        resolved.connections,
+        context=_context(resolved.project, resolved.base_dir),
+    )
+    return store, resolved.profile_name
 
 
 def notification_policy_from_project(project: MetricRuntimeProjectConfig) -> NotificationPolicy:
@@ -474,7 +482,7 @@ def show_resolved_config(
         "profile": profile,
         "project": project.model_dump(mode="json"),
         "profile_wiring": profile_cfg.model_dump(mode="json"),
-        "connections": redact_secrets(raw_connections.get("connections", {})),
+        "connections": redact_connections(raw_connections.get("connections") or {}),
         "profiles": {
             name: cfg.model_dump(mode="json") for name, cfg in connections.profiles.items()
         },
@@ -487,10 +495,13 @@ __all__ = [
     "KPICatalog",
     "Metric",
     "MetricCatalog",
+    "build_executor_from_connection",
     "build_metric_runtime",
     "build_notifier",
+    "build_profile_runtime_store",
     "build_runtime",
     "build_runtime_store",
+    "build_state_store",
     "load_catalog_entrypoint",
     "notification_policy_from_project",
     "resolve_profile",

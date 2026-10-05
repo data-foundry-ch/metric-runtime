@@ -26,7 +26,7 @@ class SqlBatchSource:
         name: str,
         query: str,
         *,
-        dialect: str | None = "duckdb",
+        dialect: str | None = None,
         columns: tuple[str, ...] | None = None,
         bindings: dict[str, object] | None = None,
     ) -> None:

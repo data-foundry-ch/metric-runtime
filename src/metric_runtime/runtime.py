@@ -24,6 +24,7 @@ from metric_runtime.exceptions import EvaluationInProgressError, StaleEvaluation
 from metric_runtime.identity import canonical_scope_key, ensure_utc
 from metric_runtime.notifications.delivery import DeliveryReport, deliver_pending
 from metric_runtime.scheduling import due_ticks, next_due_at
+from metric_runtime.stores.base import ManagedRuntimeStore
 
 if TYPE_CHECKING:
     from metric_runtime.config.models import RuntimeConfig
@@ -220,9 +221,8 @@ class MetricRuntime:
 
     def ensure_ready(self) -> None:
         """Refuse to run against a runtime store with pending migrations."""
-        ensure = getattr(self.store, "ensure_migrated", None)
-        if callable(ensure):
-            ensure()
+        if isinstance(self.store, ManagedRuntimeStore):
+            self.store.ensure_ready()
 
     def due_evaluations(
         self, now: datetime | None = None

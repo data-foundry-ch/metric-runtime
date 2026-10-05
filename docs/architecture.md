@@ -3,6 +3,52 @@
 Metric Runtime is a Python-native framework for **defining, validating,
 executing and operationalizing** semantic business metrics.
 
+## Adapter-first: run where the metrics live
+
+Metric Runtime runs against your existing data platform. Install the adapter
+for that platform, read business facts from it, and write Metric Runtime
+observations, state, incidents, and outbox records back to a dedicated
+runtime namespace.
+
+```
+Your Data Platform
+├── business data      → Metric Runtime reads    (metric_source)
+└── metric_runtime     ← Metric Runtime writes   (runtime_store)
+```
+
+The core package is platform-neutral. It owns metric semantics,
+calculations, detection, state, incidents, scheduling, orchestration and
+three contracts: `MetricExecutor`, `RuntimeStore` and `Notifier`. An
+**adapter**, resolved from a connection's `type`, owns everything
+platform-specific: connections, SQL dialect, query execution, schema
+creation, locking/concurrency and persistence.
+
+```mermaid
+flowchart LR
+  Profile["profile roles"] --> Registry["adapter registry (connection type)"]
+  Registry --> Source["metric_source: MetricExecutor"]
+  Registry --> Store["runtime_store: RuntimeStore"]
+  Registry --> Notify["notifier: Notifier"]
+```
+
+One connection may serve both `metric_source` and `runtime_store`; the roles
+stay logically separate (read-only source namespace, writable runtime
+namespace) and each role gets its own client resources. The runtime store's
+adapter defines the boundary that keeps runtime objects from colliding with
+source data — for Postgres, a separate schema.
+
+Split platforms are equally valid, each role resolved independently:
+
+```yaml
+profiles:
+  production:
+    metric_source: warehouse      # e.g. a warehouse adapter
+    runtime_store: operational_db # e.g. postgres
+```
+
+See [adapters.md](adapters.md) for the adapter contract and how external
+adapter packages register themselves.
+
 ```
                    Metric Repository
                          │
@@ -66,8 +112,8 @@ Runtime lifecycle
 
 | Layer | Owns |
 |---|---|
-| Metric Runtime | semantic contract, calculation contracts, evaluation orchestration, observation creation, state lifecycle |
-| Executor | connection-specific mechanics (DuckDB SQL binding, fact-table aggregates) |
+| Metric Runtime | semantic contract, calculation contracts, evaluation orchestration, observation creation, state lifecycle, executor/store/notifier contracts |
+| Adapter | platform mechanics: connection config, SQL dialect and binding, fact-table aggregates, runtime schema and migrations, locking, persistence |
 | Application | domain SQL, batch registrations, catalog definitions |
 
 ## Business graph vs execution graph
@@ -163,10 +209,25 @@ what metric-runtime already observed and concluded: observations, metric
 state, committed evaluations, evaluation claims, incidents and the
 notification outbox.
 
-- `InMemoryRuntimeStore` (alias `InMemoryStateStore`) — zero-infra, per process.
-- `PostgresRuntimeStore` — durable, multi-worker safe; tables live in a
-  dedicated schema created by numbered migrations
-  (`metric-runtime store migrate`). Install with
+The contract is expressed as guarantees, not database mechanisms. Every
+implementation must:
+
+- claim an evaluation uniquely;
+- commit evaluations idempotently and atomically;
+- apply metric state in `effective_at` order per (metric, scope);
+- persist observations and incidents with the commit;
+- lease notification work to one deliverer at a time;
+- recover expired claims and leases after a worker fails.
+
+Stores with a versioned schema also implement the optional
+`ManagedRuntimeStore` protocol (`namespace`, `schema_status()`, `migrate()`,
+`ensure_ready()`), which `store migrate` / `store status` use.
+
+- `InMemoryRuntimeStore` (alias `InMemoryStateStore`, `type: memory`) —
+  zero-infra, per process.
+- `PostgresRuntimeStore` (`type: postgres`, the reference adapter) — durable,
+  multi-worker safe; tables live in a dedicated runtime schema created by
+  numbered migrations (`metric-runtime store migrate`). Install with
   `pip install "metric-runtime[postgres]"`.
 
 Warehouse/lake = historical business facts.
@@ -251,13 +312,15 @@ Only one worker may own an `EvaluationKey` for transition processing
 (`claim_evaluation`). Concurrent callers receive either the committed result
 or `EvaluationInProgressError`.
 
-In Postgres, claims are leased rows (`expires_at`, from `claim_ttl`), so a
+How a store enforces this is up to its adapter. In the Postgres adapter,
+claims are leased rows (`expires_at`, from `claim_ttl`), so a
 crashed worker's claim can be taken over. Waiting for earlier windows of a
 stream holds no lock. The commit itself takes a transaction-scoped advisory
 lock per `(metric, scope)` (`pg_advisory_xact_lock`), re-checks the claim,
 duplicates, staleness and earlier in-flight claims while holding it, and
-guards the metric-state upsert with the expected version. A conflict found
-at commit (`StreamCommitConflict`) makes `process()` re-run the ordered
+guards the metric-state upsert with the expected version. Whatever the
+mechanism, a conflict found at commit (`StreamCommitConflict`) makes
+`process()` re-run the ordered
 section (re-read state, recompute) up to 3 times; the calculated observation
 is reused.
 
