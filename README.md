@@ -7,6 +7,40 @@ operationalizing semantic business metrics.
 > metric-runtime is experimental.
 > APIs may change substantially before 1.0.
 
+## Runs where your metrics live
+
+Metric Runtime runs against your existing data platform. Install the adapter
+for that platform, read business facts from it, and write Metric Runtime
+observations, state, incidents, and outbox records back to a dedicated
+runtime namespace.
+
+```
+Your Data Platform
+├── business data      → Metric Runtime reads
+└── metric_runtime     ← Metric Runtime writes
+```
+
+```yaml
+# connections.yaml — one connection, two logical roles
+connections:
+  warehouse:
+    type: postgres
+    dsn: ${DATABASE_URL}
+    source_schema: analytics
+    runtime_schema: metric_runtime
+
+profiles:
+  production:
+    metric_source: warehouse
+    runtime_store: warehouse
+```
+
+Source and runtime can also live on different platforms (e.g. a DuckDB or
+warehouse source with a Postgres runtime store). Built-in adapters: `postgres`
+(source + durable runtime store), `duckdb` (local source), `memory`
+(development runtime store) and `webhook` (notifications). Other platforms
+plug in as separate packages — see [docs/adapters.md](docs/adapters.md).
+
 ## Four capabilities
 
 | | |
@@ -150,23 +184,25 @@ See [docs/migration-metric-model.md](docs/migration-metric-model.md).
                             Investigation
 ```
 
-In production the runtime is wired into three roles per profile:
+In production each profile wires connections into three roles; each role is
+resolved through the adapter registered for the connection's `type`:
 
 ```
 metric-runtime run --profile production
         │
-        ├── metric_source   analytical data, read-only (DuckDB or Postgres)
-        ├── runtime_store   durable conclusions: observations, state,
-        │                   evaluations, incidents, outbox (Postgres)
-        └── notifier        outbox delivery (webhook, logging, custom)
+        ├── metric_source   business facts, read-only      (MetricExecutor)
+        ├── runtime_store   observations, state, evaluations,
+        │                   incidents, outbox               (RuntimeStore)
+        └── notifier        outbox delivery                 (Notifier)
 ```
 
 `MetricRuntime` schedules due windows and drains the outbox, `KPIEngine`
-evaluates and commits, and the store/executor/notifier are pluggable
-adapters. `run --once` fits cron and CronJobs; `run` is a long-lived worker.
+evaluates and commits; executors, runtime stores and notifiers come from
+adapters. The core package assumes no database. `run --once` fits cron and
+CronJobs; `run` is a long-lived worker.
 
-More detail: [docs/architecture.md](docs/architecture.md) and
-[docs/production.md](docs/production.md).
+More detail: [docs/architecture.md](docs/architecture.md),
+[docs/adapters.md](docs/adapters.md) and [docs/production.md](docs/production.md).
 
 ## Examples
 
@@ -186,10 +222,9 @@ LLM. Metric Runtime does not depend on either provider.
 
 ```bash
 pip install metric-runtime
-# or with DuckDB backend:
-pip install "metric-runtime[duckdb]"
-# durable runtime store / Postgres source:
-pip install "metric-runtime[postgres]"
+# plus the adapter for your platform, e.g.
+pip install "metric-runtime[postgres]"   # Postgres source + durable runtime store
+pip install "metric-runtime[duckdb]"     # local DuckDB source
 ```
 
 ## License

@@ -82,7 +82,7 @@ Issues = "https://github.com/data-foundry-ch/metric-runtime/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-metric_runtime = ["py.typed", "stores/migrations/postgres/*.sql"]
+metric_runtime = ["py.typed", "adapters/postgres/migrations/*.sql"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]

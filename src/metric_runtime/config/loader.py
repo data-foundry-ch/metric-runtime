@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover
 
 DEFAULT_PROJECT_FILENAMES = ("metric-runtime.yaml", "metric_runtime.yaml")
 DEFAULT_CONNECTIONS_FILENAMES = ("connections.yaml",)
+_REDACTED = "***REDACTED***"
 
 
 def _require_yaml() -> Any:
@@ -130,10 +131,56 @@ def redact_secrets(data: Any) -> Any:
         out = {}
         for k, v in data.items():
             if str(k).lower() in secret_keys or str(k).lower().endswith("_password"):
-                out[k] = "***REDACTED***"
+                out[k] = _REDACTED
             else:
                 out[k] = redact_secrets(v)
         return out
     if isinstance(data, list):
         return [redact_secrets(v) for v in data]
     return data
+
+
+def _mentions_secret(annotation: Any) -> bool:
+    from typing import get_args
+
+    from pydantic import SecretBytes, SecretStr
+
+    if annotation in (SecretStr, SecretBytes):
+        return True
+    return any(_mentions_secret(arg) for arg in get_args(annotation))
+
+
+def secret_field_names(model: type[Any]) -> set[str]:
+    """Field names (and aliases) a pydantic model declares as ``SecretStr``."""
+    from pydantic import AliasChoices
+
+    names: set[str] = set()
+    for name, info in getattr(model, "model_fields", {}).items():
+        if not _mentions_secret(info.annotation):
+            continue
+        names.add(name)
+        if isinstance(info.alias, str):
+            names.add(info.alias)
+        if isinstance(info.validation_alias, str):
+            names.add(info.validation_alias)
+        elif isinstance(info.validation_alias, AliasChoices):
+            names.update(c for c in info.validation_alias.choices if isinstance(c, str))
+    return names
+
+
+def redact_connections(connections: dict[str, Any]) -> dict[str, Any]:
+    """Redact raw connection configs: adapter-declared secrets plus key heuristics."""
+    from metric_runtime.adapters.registry import get_adapter
+
+    out: dict[str, Any] = {}
+    for name, cfg in connections.items():
+        if not isinstance(cfg, dict):
+            out[name] = redact_secrets(cfg)
+            continue
+        try:
+            secret = secret_field_names(get_adapter(cfg.get("type")).config_model)
+        except ConfigurationError:
+            secret = set()
+        masked = {k: (_REDACTED if k in secret else v) for k, v in cfg.items()}
+        out[name] = redact_secrets(masked)
+    return out

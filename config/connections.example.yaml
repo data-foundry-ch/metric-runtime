@@ -3,8 +3,11 @@
 # Semantics live with the project (metric-runtime.yaml).
 # Connections live with the environment (this file).
 #
+# Each connection's `type` selects an adapter (built-in: postgres, duckdb,
+# memory, webhook; others install as packages, e.g. metric-runtime-snowflake).
+#
 # Roles per profile:
-#   metric_source  — analytical source the metrics are calculated from (read-only)
+#   metric_source  — business data the metrics are calculated from (read-only)
 #   runtime_store  — where metric-runtime keeps its conclusions: observations,
 #                    metric state, evaluations, incidents, notification outbox
 #                    (`state_store` is accepted as a deprecated alias)
@@ -14,15 +17,29 @@
 # a missing variable only fails when a profile actually uses that connection.
 
 connections:
+  # The common case: ONE connection serves both roles. Business data is read
+  # from source_schema; Metric Runtime writes to runtime_schema. Apply the
+  # runtime schema with:  metric-runtime store migrate --profile production
+  warehouse:
+    type: postgres
+    dsn: ${DATABASE_URL}
+    # Alternatively: host / port / database / user / password / sslmode
+    source_schema: analytics
+    fact_table: facts              # resolved in source_schema unless qualified
+    timestamp_column: ts
+    statement_timeout: 30s
+    runtime_schema: metric_runtime # must differ from the source schema
+    claim_ttl: 15m                 # crashed workers' evaluation claims expire after this
+
+  # Local analytical source for development.
   local_analytics:
     type: duckdb
     path: ./examples/pypizza/data/pypizza.duckdb
     fact_table: pypizza_halfhourly
     read_only: true
 
-  # Durable runtime store. Apply the schema with:
-  #   metric-runtime store migrate --profile production
-  runtime_db:
+  # A separate operational database as runtime store (split-platform setups).
+  ops_db:
     type: postgres
     host: ${RUNTIME_DB_HOST}
     port: 5432
@@ -30,18 +47,7 @@ connections:
     user: ${RUNTIME_DB_USER}
     password: ${RUNTIME_DB_PASSWORD}
     sslmode: require
-    schema: metric_runtime       # dedicated schema for runtime tables
-    claim_ttl: 15m               # crashed workers' evaluation claims expire after this
-    # Alternatively: dsn: ${RUNTIME_DB_DSN}
-
-  # Postgres as the analytical source (read-only sessions). If it shares a
-  # database with runtime_db, the schemas must differ.
-  analytics_db:
-    type: postgres
-    dsn: ${ANALYTICS_DB_DSN}
-    fact_table: analytics.facts  # schema-qualified; used by formula metrics
-    timestamp_column: ts
-    statement_timeout: 30s
+    runtime_schema: metric_runtime
 
   # Outbox delivery: one JSON POST per event, Idempotency-Key = event_key.
   ops_webhook:
@@ -52,27 +58,24 @@ connections:
     # headers:
     #   Authorization: Bearer ${WEBHOOK_TOKEN}
 
-  # --- Future adapters (NOT implemented yet) ---
-  # production_warehouse:
-  #   type: snowflake
+  # --- External adapters (install the adapter package first) ---
+  # snowflake_warehouse:
+  #   type: snowflake              # pip install metric-runtime-snowflake
   #   account: ${SNOWFLAKE_ACCOUNT}
-  #   database: ANALYTICS
-  #   schema: MARTS
-  #   warehouse: MONITORING_WH
-  #   user: ${SNOWFLAKE_USER}
-  #   password: ${SNOWFLAKE_PASSWORD}
+  #   ...
 
 profiles:
+  production:
+    metric_source: warehouse
+    runtime_store: warehouse
+    notifier: ops_webhook
+
   local:
     metric_source: local_analytics
     runtime_store:
       type: memory
 
-  production:
+  # Split platforms: local DuckDB source, durable Postgres runtime store.
+  split:
     metric_source: local_analytics
-    runtime_store: runtime_db
-    notifier: ops_webhook
-
-  warehouse_pg:
-    metric_source: analytics_db
-    runtime_store: runtime_db
+    runtime_store: ops_db

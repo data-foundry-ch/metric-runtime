@@ -95,7 +95,7 @@ def test_store_commands_with_memory_profile(capsys):
     assert main(_base("store", "migrate")) == 0
     assert "nothing to migrate" in capsys.readouterr().out
     assert main(_base("store", "status")) == 0
-    assert "in-memory" in capsys.readouterr().out
+    assert "not durable" in capsys.readouterr().out
 
 
 def test_profile_flag_after_nested_subcommand_is_kept(capsys):
@@ -145,7 +145,8 @@ def test_validate_rejects_runtime_tables_in_source_schema(tmp_path, capsys):
         "profiles:\n  local:\n    metric_source: pg\n    runtime_store: pg\n",
     )
     assert main(_base("validate", connections=conns)) == 1
-    assert "same database and schema 'public'" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "runtime_schema 'public'" in err and "effective source schema 'public'" in err
 
 
 def test_validate_postgres_runtime_store_offline_without_env(tmp_path, capsys, monkeypatch):

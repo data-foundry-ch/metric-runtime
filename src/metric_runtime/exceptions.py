@@ -53,7 +53,11 @@ class UnknownConnectionError(ConfigurationError):
 
 
 class UnsupportedConnectionTypeError(ConfigurationError):
-    """Connection type is not implemented in this version."""
+    """No adapter is registered for the connection type."""
+
+
+class UnsupportedRoleError(ConfigurationError):
+    """The connection's adapter cannot serve the requested profile role."""
 
 
 class EvaluationInProgressError(MetricRuntimeError):

@@ -8,14 +8,25 @@
 ```
 metric-runtime run --profile production
         │
-        ├── metric_source   analytical data, read-only (DuckDB or Postgres)
-        ├── runtime_store   durable runtime conclusions (Postgres)
+        ├── metric_source   business facts, read-only
+        ├── runtime_store   durable runtime conclusions
         └── notifier        outbox delivery (webhook / logging / your adapter)
+```
+
+Each role is served by the adapter of the connection it points to (see
+[adapters.md](adapters.md)). The common setup is one data platform for both
+roles — business data in one namespace, Metric Runtime's tables in another:
+
+```
+Your Data Platform
+├── business data      → Metric Runtime reads
+└── metric_runtime     ← Metric Runtime writes
 ```
 
 `run --profile production` survives restarts: everything it has concluded
 (observations, metric state, committed evaluations, incidents, pending
-notifications) lives in the Postgres runtime store, not in the process.
+notifications) lives in the durable runtime store, not in the process. This
+page uses Postgres, the reference adapter, for the examples.
 
 ## 1. Configure profiles
 
@@ -43,20 +54,17 @@ runtime:
     lease: 5m                  # a claimed event is exclusive for this long
 ```
 
-`connections.yaml` (do not commit secrets) wires resources into **roles**:
+`connections.yaml` (do not commit secrets) wires resources into **roles**.
+The common case is one connection for both source and runtime store:
 
 ```yaml
 connections:
-  analytics:
-    type: duckdb
-    path: /data/analytics.duckdb
-    fact_table: facts
-    read_only: true
-
-  runtime_db:
+  warehouse:
     type: postgres
-    dsn: ${METRIC_RUNTIME_POSTGRES_DSN}   # or host/port/database/user/password/sslmode
-    schema: metric_runtime                # dedicated schema for runtime tables
+    dsn: ${DATABASE_URL}          # or host/port/database/user/password/sslmode
+    source_schema: analytics      # business data (read-only sessions)
+    fact_table: facts             # resolved in source_schema unless qualified
+    runtime_schema: metric_runtime  # Metric Runtime's tables
     claim_ttl: 15m
 
   ops_webhook:
@@ -66,12 +74,36 @@ connections:
 
 profiles:
   production:
-    metric_source: analytics
-    runtime_store: runtime_db
-    notifier: ops_webhook                 # omit for logging; `notifier: {type: none}` to drop
+    metric_source: warehouse
+    runtime_store: warehouse
+    notifier: ops_webhook         # omit for logging; `notifier: {type: none}` to drop
 ```
 
-`state_store:` is accepted as a deprecated alias for `runtime_store:`.
+The two roles still get separate clients: a read-only session for the source
+and a writable pool for the runtime store. The runtime schema must differ
+from the schema business data is read from (validation rejects it otherwise).
+
+Split platforms work the same way, each role resolved independently:
+
+```yaml
+connections:
+  analytics:
+    type: duckdb                  # or any other source adapter
+    path: /data/analytics.duckdb
+    fact_table: facts
+  runtime_db:
+    type: postgres
+    dsn: ${METRIC_RUNTIME_POSTGRES_DSN}
+    runtime_schema: metric_runtime
+
+profiles:
+  production:
+    metric_source: analytics
+    runtime_store: runtime_db
+```
+
+`state_store:` is accepted as a deprecated alias for `runtime_store:`, and
+`schema:` for a Postgres connection's `runtime_schema:`.
 Environment placeholders are resolved lazily: a missing variable only fails
 for profiles that use that connection.
 
@@ -238,9 +270,9 @@ redirect (redirects are never followed), timeout, connection error — counts
 as a failed attempt and is retried with backoff. Error messages never include
 the URL, since it often embeds a token.
 
-## 6. Runtime store tables
+## 6. Runtime store tables (Postgres adapter)
 
-All in the configured schema (default `metric_runtime`):
+All in the configured `runtime_schema` (default `metric_runtime`):
 
 | Table | Holds |
 |---|---|
@@ -259,17 +291,19 @@ analytical source. Use a dedicated schema (and preferably a dedicated role).
 
 ```yaml
 connections:
-  analytics_db:
+  warehouse:
     type: postgres
-    dsn: ${ANALYTICS_DB_DSN}
-    fact_table: analytics.facts   # formula metrics aggregate this table
+    dsn: ${DATABASE_URL}
+    source_schema: analytics      # search_path of the read-only session
+    fact_table: facts             # formula metrics aggregate analytics.facts
     timestamp_column: ts
     statement_timeout: 30s
 ```
 
-`PostgresExecutor` opens read-only sessions (`default_transaction_read_only`
-plus an explicit `READ ONLY` transaction per query), sets the session time
-zone to UTC and applies `statement_timeout`. Formula metrics are aggregated in
+`PostgresExecutor` opens its own read-only session
+(`default_transaction_read_only` plus an explicit `READ ONLY` transaction per
+query), sets `search_path` to `source_schema`, the session time zone to UTC
+and applies `statement_timeout`. Formula metrics are aggregated in
 SQL. SQL calculations and batch sources declare `dialect: postgres` and use
 `:name` parameters (`:effective_at`, `:window_start`, `:window_end`, …), which
 are bound server-side and never interpolated. A query must return exactly one
@@ -278,21 +312,23 @@ row; zero rows is NO_DATA.
 Grant the source role `SELECT` only. Read-only sessions are defence in depth,
 not a substitute for privileges.
 
-The source and the runtime store may share a Postgres server or database, but
-not a schema: `validate` (and every command that builds the runtime) rejects
-a profile whose `runtime_store` and `metric_source` resolve to the same
-database and schema.
+The source and the runtime store may share a Postgres connection, server or
+database, but not a schema: `validate` (and every command that builds the
+runtime) rejects a profile whose runtime schema equals the **effective**
+source schema on the same database — the schema of a qualified `fact_table`
+(e.g. `metric_runtime.orders`) wins over `source_schema`.
 
 ## DuckDB's role
 
-DuckDB is an analytical execution backend (local working sets, Parquet,
-dimensional investigation). It is **not** metric-runtime's state database:
-a profile that points `runtime_store` at a DuckDB connection fails
-validation.
+DuckDB is the lightweight local adapter: an analytical source for local
+working sets, Parquet and dimensional investigation. It does not offer a
+runtime store (single-writer, not safe for shared claims), so a profile that
+points `runtime_store` at a DuckDB connection fails validation.
 
 ## What not to expect
 
 metric-runtime is not an AI/LLM framework, a BI replacement, or a complete
-observability platform. Warehouse adapters beyond DuckDB and Postgres
-(Snowflake, BigQuery, Databricks), per-dimension scheduled streams and config
-hot-reload are not part of this release.
+observability platform. Adapters beyond the built-ins (Snowflake, BigQuery,
+Databricks) are not part of this release — the adapter registry is ready for
+them as separate packages. Per-dimension scheduled streams and config
+hot-reload are also out of scope.

@@ -72,7 +72,8 @@ class EvaluationSession:
         self.catalog = catalog if isinstance(catalog, KPICatalog) else KPICatalog(catalog)
         self.executor = executor
         self.batch_registry = batch_registry or BatchRegistry()
-        self.sql_dialects = sql_dialects or frozenset({"duckdb"})
+        # None: accept whatever the executor declares in its own ``sql_dialects``.
+        self.sql_dialects = sql_dialects
         self._batch_cache: dict[tuple[str, str], dict[str, float | None]] = {}
         self._validate_catalog_calculations()
 
@@ -340,7 +341,11 @@ class EvaluationSession:
 
     def _require_sql_executor(self, dialect: str | None) -> Any:
         executor = self._require_executor()
-        if dialect is not None and dialect not in self.sql_dialects:
+        if (
+            dialect is not None
+            and self.sql_dialects is not None
+            and dialect not in self.sql_dialects
+        ):
             raise MetricRuntimeError(
                 f"SQL dialect {dialect!r} is not supported by this executor "
                 f"(supported: {sorted(self.sql_dialects)}). "

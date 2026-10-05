@@ -104,7 +104,7 @@ class KPIEngine:
             self._catalog = MetricCatalog(list(catalog))
 
         if connection is not None and executor is None:
-            from metric_runtime.execution.duckdb import DuckDBExecutor
+            from metric_runtime.adapters.duckdb.executor import DuckDBExecutor
 
             executor = DuckDBExecutor(connection, fact_table=fact_table)
 
@@ -166,7 +166,7 @@ class KPIEngine:
     def _require_executor(self):
         if self.executor is None:
             raise MetricRuntimeError(
-                "KPIEngine has no executor. Pass DuckDBExecutor(...) "
+                "KPIEngine has no executor. Pass executor=... (e.g. from an adapter) "
                 "or build via KPIEngine.from_profile(...)."
             )
         return self.executor

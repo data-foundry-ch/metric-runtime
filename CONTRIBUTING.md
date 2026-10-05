@@ -49,25 +49,31 @@ Implement `detect(...)` / `evaluate(...)` following
 `metric_runtime.detectors.DetectorStrategy`. Add unit tests in
 `tests/test_detectors.py`.
 
-### Add an executor
+### Add a platform adapter
 
-Implement the `MetricExecutor` protocol in `metric_runtime.execution`.
-Keep credentials out of KPI definitions. Wire via `connections.yaml` + factory
-only when the adapter is real.
+Platform code never goes into core modules. Write an adapter (see
+[docs/adapters.md](docs/adapters.md)): a `BaseAdapter` subclass with a
+`config_model` and `AdapterCapabilities`, building a `MetricExecutor` and/or
+`RuntimeStore` and/or `Notifier`. Keep each adapter self-contained in its own
+package (`metric_runtime/adapters/<platform>/` for built-ins, or an external
+`metric-runtime-<platform>` package registered through the
+`metric_runtime.adapters` entry-point group). No factory or CLI change is
+needed. Keep credentials out of metric definitions.
 
 ### Add a runtime store
 
 Implement the `RuntimeStore` protocol (`metric_runtime.stores.base`; the
-`StateStore` name is an alias). Reuse `stores.staging.StagedTransaction` for
-read-your-writes staging, and add your store to the `store_factory` fixture in
-`tests/conftest.py` so it runs the shared contract tests
-(`test_runtime_store_contract.py`, `test_outbox_leases.py`,
-`test_no_data_outcome.py`, `test_run_once.py`).
+`StateStore` name is an alias) and meet its documented guarantees. Reuse
+`stores.staging.StagedTransaction` for read-your-writes staging, and add your
+store to the `store_factory` fixture in `tests/conftest.py` so it runs the
+shared contract tests (`test_runtime_store_contract.py`,
+`test_outbox_leases.py`, `test_no_data_outcome.py`, `test_run_once.py`).
+Implement `ManagedRuntimeStore` if the store has a versioned schema.
 
 ### Add a runtime store migration
 
 Add the next numbered file under
-`src/metric_runtime/stores/migrations/postgres/` (e.g. `002_add_index.sql`).
+`src/metric_runtime/adapters/postgres/migrations/` (e.g. `002_add_index.sql`).
 Never edit an applied file (checksums are verified). Migrations run in a
 single transaction, so avoid `CREATE INDEX CONCURRENTLY` / `VACUUM`. Use
 unqualified table names; `search_path` points at the runtime schema.

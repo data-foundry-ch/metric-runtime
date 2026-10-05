@@ -1,6 +1,7 @@
 # PyPizza demo profiles.
 #   local:      DuckDB source + in-memory runtime store (no credentials).
-#   production: DuckDB source + durable Postgres runtime store.
+#   production: DuckDB source + durable Postgres runtime store (split platforms:
+#               the demo data ships as a DuckDB file).
 #               export METRIC_RUNTIME_POSTGRES_DSN=postgresql://user:pass@host:5432/db
 connections:
   pypizza:
@@ -12,7 +13,7 @@ connections:
   runtime_db:
     type: postgres
     dsn: ${METRIC_RUNTIME_POSTGRES_DSN}
-    schema: metric_runtime
+    runtime_schema: metric_runtime
 
 profiles:
   local:

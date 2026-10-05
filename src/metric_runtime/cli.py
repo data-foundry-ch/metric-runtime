@@ -9,6 +9,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from metric_runtime.stores.base import RuntimeStore
 
 
 def _load_project_catalog(args: argparse.Namespace):
@@ -45,6 +49,19 @@ def _cmd_config_show(args: argparse.Namespace) -> int:
         return 1
     print(json.dumps(data, indent=2, default=str))
     return 0
+
+
+def _describe_role(connections, ref, default: str) -> str:
+    """``name (type: capabilities)`` for a connection, or the inline/default description."""
+    from metric_runtime.adapters import get_adapter
+
+    if ref is None:
+        return default
+    if not isinstance(ref, str):
+        return f"{ref.type} (inline)"
+    ctype = connections.connection_type(ref)
+    capabilities = ", ".join(get_adapter(ctype).capabilities.names())
+    return f"{ref} ({ctype}: {capabilities})"
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
@@ -90,18 +107,13 @@ def _cmd_validate(args: argparse.Namespace) -> int:
             wiring_errors = validate_profile_wiring(profile_cfg, connections, check_fields=False)
             errors.extend(f"profile {profile_name!r}: {err}" for err in wiring_errors)
             if not wiring_errors:
-                store = profile_cfg.runtime_store
-                store_desc = store if isinstance(store, str) else "memory (inline)"
-                notifier = profile_cfg.notifier
-                notifier_desc = (
-                    notifier
-                    if isinstance(notifier, str)
-                    else (notifier.type if notifier is not None else "logging")
-                )
-                print(
-                    f"roles: metric_source={profile_cfg.metric_source or '-'} "
-                    f"runtime_store={store_desc} notifier={notifier_desc}"
-                )
+                print("roles:")
+                for role, ref, default in (
+                    ("metric_source", profile_cfg.metric_source, "-"),
+                    ("runtime_store", profile_cfg.runtime_store, "memory (default)"),
+                    ("notifier", profile_cfg.notifier, "logging (default)"),
+                ):
+                    print(f"  {role}={_describe_role(connections, ref, default)}")
         except MetricRuntimeError as exc:
             errors.append(str(exc))
     else:
@@ -309,7 +321,7 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
     return _evaluate_one(args, args.metric)
 
 
-def _store_for(args: argparse.Namespace):
+def _store_for(args: argparse.Namespace) -> tuple[RuntimeStore, str]:
     from metric_runtime.config.factory import build_profile_runtime_store
 
     return build_profile_runtime_store(
@@ -321,6 +333,7 @@ def _store_for(args: argparse.Namespace):
 
 def _cmd_store_migrate(args: argparse.Namespace) -> int:
     from metric_runtime.exceptions import MetricRuntimeError
+    from metric_runtime.stores.base import ManagedRuntimeStore
 
     try:
         store, profile = _store_for(args)
@@ -328,28 +341,28 @@ def _cmd_store_migrate(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     try:
-        migrate = getattr(store, "migrate", None)
-        if not callable(migrate):
-            print(f"profile {profile}: runtime store is in-memory; nothing to migrate")
+        if not isinstance(store, ManagedRuntimeStore):
+            print(f"profile {profile}: runtime store has no versioned schema; nothing to migrate")
             return 0
-        applied = migrate()
+        namespace = store.namespace
+        applied = store.migrate()
     except Exception as exc:  # noqa: BLE001 - surface DB errors without a traceback
         print(f"error: migration failed: {exc}", file=sys.stderr)
         return 1
     finally:
         store.close()
-    schema = getattr(store, "schema", "?")
     if applied:
         for m in applied:
             print(f"applied {m.filename}")
-        print(f"schema {schema}: {len(applied)} migration(s) applied")
+        print(f"{namespace}: {len(applied)} migration(s) applied")
     else:
-        print(f"schema {schema}: up to date")
+        print(f"{namespace}: up to date")
     return 0
 
 
 def _cmd_store_status(args: argparse.Namespace) -> int:
     from metric_runtime.exceptions import MetricRuntimeError
+    from metric_runtime.stores.base import ManagedRuntimeStore
 
     try:
         store, profile = _store_for(args)
@@ -357,24 +370,23 @@ def _cmd_store_status(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     try:
-        if not callable(getattr(store, "pending_migrations", None)):
-            print(f"profile {profile}: runtime store is in-memory (not durable)")
+        if not isinstance(store, ManagedRuntimeStore):
+            print(f"profile {profile}: runtime store has no versioned schema (not durable)")
             return 0
-        applied = store.applied_migrations()
-        pending = store.pending_migrations()
+        status = store.schema_status()
     except Exception as exc:  # noqa: BLE001
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
         store.close()
     print(f"profile: {profile}")
-    print(f"schema: {store.schema}")
-    for version, (name, _checksum) in sorted(applied.items()):
+    print(f"namespace: {status.namespace}")
+    for version, (name, _checksum) in sorted(status.applied.items()):
         print(f"  applied {version:03d}_{name}")
-    for m in pending:
+    for m in status.pending:
         print(f"  pending {m.filename}")
-    if pending:
-        print(f"{len(pending)} pending migration(s): run 'metric-runtime store migrate'")
+    if status.pending:
+        print(f"{len(status.pending)} pending migration(s): run 'metric-runtime store migrate'")
         return 1 if args.check else 0
     print("up to date")
     return 0
